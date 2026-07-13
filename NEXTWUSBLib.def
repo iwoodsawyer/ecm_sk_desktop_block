@@ -1,0 +1,11 @@
+; ============================================================================
+; NEXTWUSBLib.def
+; MSVC module-definition file — ensures correct __stdcall name decoration
+; is stripped for the public DLL exports.
+; ============================================================================
+LIBRARY   NEXTWUSBLib
+EXPORTS
+    OpenECMUSB
+    CloseECMUSB
+    ECMUSBWrite
+    ECMUSBRead
