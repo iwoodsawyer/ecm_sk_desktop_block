@@ -23,13 +23,6 @@ It is specifically designed for engineers and researchers requiring a low-latenc
 - **Drivers:** 
   - The device uses WinUSB/SetupAPI. Ensure the vendor drivers for the ECM-SK are installed.
 
-## Install the WinUSB Driver
-The ECM-SK appears as a Cypress USB device (VID 0x04B4, PID 0x00F1). Use Zadig to replace the default HID driver with WinUSB:
-1. Open Zadig → Options → List All Devices
-2. Select ECM-SK (or Cypress FX2LP / USB Device)
-3. Choose WinUSB (v6.x) as the target driver
-4. Click Replace Driver
-
 ## Installation & Compilation
 1. Clone or download this repository to your MATLAB workspace.
 2. Open MATLAB and navigate to the project folder.

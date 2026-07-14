@@ -1,13 +1,16 @@
 // ============================================================================
 // NEXTWUSBLib.h
 // Public header for the NEXTWUSBLib DLL
-// USB EtherCAT EC-01M Master Module Driver — Windows API Implementation
+// USB EtherCAT EC-01M Master Module Driver — Windows HID API Implementation
+//
+// The ECM-SK device enumerates as a USB HID class device (VID 16C0 / PID 05DF)
+// under the standard Windows HidUsb.sys driver. No custom driver or Zadig
+// installation is required.
 //
 // Supports both 12-byte (DEF_MA_MAX=42) and 16-byte (DEF_MA_MAX=32)
 // transData packet variants. Define USE_16B before including to select 16B.
 //
-// Author : Generated for NEXTW EC-01M
-// Platform: Windows (WinUSB / SetupAPI)
+// Platform: Windows (HID API / SetupAPI)
 // ============================================================================
 #pragma once
 
@@ -25,13 +28,13 @@ extern "C" {
 #endif
 
 // --------------------------------------------------------------------------
-// Core DLL API  (matches the original NEXTWUSBLib_12B/16B.h signatures)
+// Core DLL API
 // --------------------------------------------------------------------------
-NEXTWUSB_API bool  __stdcall OpenECMUSB  (void);
-NEXTWUSB_API void  __stdcall CloseECMUSB (void);
-NEXTWUSB_API bool  __stdcall ECMUSBWrite (unsigned char *data, unsigned long dwLength);
-NEXTWUSB_API bool  __stdcall ECMUSBRead  (unsigned char *data, unsigned long dwLength);
-NEXTWUSB_API void  __stdcall ECMUSBRecover(void); // Pipe abort+reset for use at shutdown only — not safe inside mdlOutputs
+NEXTWUSB_API bool  __stdcall OpenECMUSB   (void);
+NEXTWUSB_API void  __stdcall CloseECMUSB  (void);
+NEXTWUSB_API bool  __stdcall ECMUSBWrite  (unsigned char *data, unsigned long dwLength);
+NEXTWUSB_API bool  __stdcall ECMUSBRead   (unsigned char *data, unsigned long dwLength);
+NEXTWUSB_API void  __stdcall ECMUSBRecover(void); // Closes and reopens the HID device handle to clear any stalled state.
 
 #ifdef __cplusplus
 } // extern "C"
@@ -98,7 +101,6 @@ NEXTWUSB_API void  __stdcall ECMUSBRecover(void); // Pipe abort+reset for use at
 #define IO      SLAVE_IO
 #define HSP     SLAVE_HSP
 #define STEP    SLAVE_STEP
-// NOTE: "None" macro omitted here to avoid conflicts; use SLAVE_NONE instead.
 
 // --------------------------------------------------------------------------
 // Array dimensions

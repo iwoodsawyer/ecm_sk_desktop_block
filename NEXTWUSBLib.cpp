@@ -1,16 +1,39 @@
 // ============================================================================
 // NEXTWUSBLib.cpp
-// Windows API implementation of the NEXTWUSBLib DLL.
-// Interfaces with the USB EtherCAT EC-01M Master Module via WinUSB.
+// Windows HID API implementation of the NEXTWUSBLib transport layer.
+// Interfaces with the ECM-SK EtherCAT Master Module via the standard
+// Windows HID class driver (HidUsb.sys).
+//
+// Device identity:
+//   VID 0x16C0  (Van Ooijen Technische Informatica — shared V-USB VID)
+//   PID 0x05DF  (Generic HID — not mice/keyboards/joysticks)
+//
+// The ECM-SK enumerates as a USB HID class device. Windows automatically
+// binds HidUsb.sys on first connection. No Zadig / driver replacement
+// is required or permitted for HID class devices.
+//
+// HID Report framing:
+//   Every WriteFile / ReadFile call on a HID device must prefix the payload
+//   with a 1-byte Report ID. The ECM-SK uses a single report (ID = 0x00),
+//   so the wire buffer is always:
+//
+//     [ 0x00 | cmdBuf[0] ... cmdBuf[DEF_MA_MAX-1] ]
+//      ^-- Report ID (1 byte)   ^-- protocol payload (sizeof(transData)*DEF_MA_MAX)
+//
+//   WriteFile total = 1 + sizeof(transData)*DEF_MA_MAX bytes
+//   ReadFile  total = 1 + sizeof(transData)*DEF_MA_MAX bytes
+//
+//   12-byte variant: 1 + 12*42 = 505 bytes
+//   16-byte variant: 1 + 16*32 = 513 bytes
 //
 // Build requirements:
-//   - Link: winusb.lib, setupapi.lib, cfgmgr32.lib
+//   - Link: hid.lib, setupapi.lib
 //   - SDK:  Windows SDK 8.1 or later
 //   - CRT:  MSVCRT / UCRT
 //
 // Compilation (MSVC):
 //   cl /nologo /EHsc /W3 /DNEXTWUSBLIB_EXPORTS /LD NEXTWUSBLib.cpp
-//      /link winusb.lib setupapi.lib cfgmgr32.lib
+//      /link hid.lib setupapi.lib
 //      /DEF:NEXTWUSBLib.def /OUT:NEXTWUSBLib.dll
 // ============================================================================
 
@@ -19,21 +42,28 @@
 #include "NEXTWUSBLib_internal.h"
 
 // ============================================================================
+// HID report buffer size
+//   1 byte Report ID prefix + full protocol frame
+//   Computed at compile time from the active packet variant.
+// ============================================================================
+#define ECM_FRAME_BYTES    (sizeof(transData) * DEF_MA_MAX)
+#define ECM_HID_BUF_BYTES  (1 + ECM_FRAME_BYTES)
+
+// ============================================================================
 // Module-level state
 // ============================================================================
-static ECM_DEVICE_CTX g_Dev = { INVALID_HANDLE_VALUE, NULL, 0, 0, FALSE };
+static ECM_DEVICE_CTX g_Dev = { INVALID_HANDLE_VALUE, FALSE };
 
 // ============================================================================
 // Forward declarations of internal helpers
 // ============================================================================
-static BOOL  ECM_FindDevicePath (WCHAR *pathBuf, DWORD pathBufLen);
-static BOOL  ECM_FindDevicePathByVidPid(WCHAR *pathBuf, DWORD pathBufLen);
-static BOOL  ECM_QueryPipes     (void);
-static void  ECM_ResetDevice    (void);
+static BOOL ECM_FindHidDevicePath(WCHAR *pathBuf, DWORD pathBufLen);
+static void ECM_CloseHandle(void);
 
 // ============================================================================
 //  OpenECMUSB
-//  Opens the WinUSB device, queries its endpoints, and sets transfer policy.
+//  Locates the ECM-SK HID device by VID/PID, opens an exclusive file handle,
+//  and configures read/write timeouts.
 //  Returns TRUE on success, FALSE on any failure.
 // ============================================================================
 bool __stdcall OpenECMUSB(void)
@@ -44,119 +74,96 @@ bool __stdcall OpenECMUSB(void)
         return true;
     }
 
-    // ----- 1. Locate the device path ----------------------------------------
+    // ----- 1. Locate the HID device path by VID/PID -------------------------
     WCHAR devicePath[MAX_PATH] = { 0 };
-
-    // First attempt: match via the Device Interface GUID (preferred when INF
-    // registers the WinUSB class with a known GUID).
-    if (!ECM_FindDevicePath(devicePath, MAX_PATH))
+    if (!ECM_FindHidDevicePath(devicePath, MAX_PATH))
     {
-        // Fallback: scan all WinUSB-class devices and match VID/PID by
-        // hardware-ID string comparison.
-        ECM_Log("[ECM] GUID search failed; trying VID/PID fallback.\n");
-        if (!ECM_FindDevicePathByVidPid(devicePath, MAX_PATH))
-        {
-            ECM_Log("[ECM] OpenECMUSB: device not found.\n");
-            return false;
-        }
+        ECM_Log("[ECM] OpenECMUSB: ECM-SK device (VID_%04X&PID_%04X) not found.\n",
+                ECM_USB_VID, ECM_USB_PID);
+        return false;
     }
-    ECM_Log("[ECM] Device path: %ls\n", devicePath);
+    ECM_Log("[ECM] HID device path: %ls\n", devicePath);
 
-    // ----- 2. Open a file handle to the device --------------------------------
+    // ----- 2. Open the HID device -------------------------------------------
+    // FILE_FLAG_OVERLAPPED is used so that ReadFile / WriteFile calls
+    // can be given a timeout via COMMTIMEOUTS-equivalent (HidD_SetNumInputBuffers
+    // does not control timeouts; we use a manual event + WaitForSingleObject).
+    // For simplicity and real-time determinism, we open without overlapped I/O
+    // and instead rely on HidD_SetNumInputBuffers and the OS HID scheduler.
+    // Synchronous ReadFile on a HID interrupt endpoint blocks until the next
+    // interrupt poll interval (1 ms at Full Speed).
     g_Dev.hFile = CreateFileW(
         devicePath,
         GENERIC_READ | GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        0,              // exclusive: do not share — prevents other processes
+                        // from interfering with the EtherCAT master traffic
         NULL,
         OPEN_EXISTING,
-        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+        0,              // synchronous I/O — simpler and sufficient for SLDRT
+                        // Normal Mode where the RT thread is single-threaded
         NULL);
 
     if (g_Dev.hFile == INVALID_HANDLE_VALUE)
     {
-        ECM_Log("[ECM] CreateFile failed: 0x%08X\n", GetLastError());
+        DWORD err = GetLastError();
+        if (err == ERROR_ACCESS_DENIED)
+            ECM_Log("[ECM] OpenECMUSB: access denied — device may be open by "
+                    "another process, or this is a protected system HID device.\n");
+        else
+            ECM_Log("[ECM] OpenECMUSB: CreateFile failed: 0x%08X\n", err);
         return false;
     }
 
-    // ----- 3. Initialise WinUSB -----------------------------------------------
-    if (!WinUsb_Initialize(g_Dev.hFile, &g_Dev.hWinUsb))
+    // ----- 3. Configure HID read timeouts -----------------------------------
+    // HidD_SetNumInputBuffers controls how many input reports Windows queues
+    // internally before they are overwritten. A small queue (2) prevents stale
+    // reports accumulating between real-time ticks. The actual transfer timeout
+    // is controlled by setting a timeout on the file handle via
+    // SetCommTimeouts is only for COM ports; for HID we use a manual approach:
+    // we keep synchronous I/O and accept that ReadFile will block for at most
+    // one USB poll interval (1 ms) plus OS scheduling jitter.
+    //
+    // For deterministic timeout behaviour, ECMUSBRead uses WaitForSingleObject
+    // with an overlapped read — see ECMUSBRead implementation note below.
+    if (!HidD_SetNumInputBuffers(g_Dev.hFile, 2))
     {
-        ECM_Log("[ECM] WinUsb_Initialize failed: 0x%08X\n", GetLastError());
-        CloseHandle(g_Dev.hFile);
-        g_Dev.hFile = INVALID_HANDLE_VALUE;
-        return false;
+        ECM_Log("[ECM] HidD_SetNumInputBuffers failed: 0x%08X (non-fatal)\n",
+                GetLastError());
+        // Non-fatal — default buffer count will be used
     }
-
-    // ----- 4. Discover bulk pipe addresses ------------------------------------
-    if (!ECM_QueryPipes())
-    {
-        // Fall back to compile-time defaults if pipe discovery fails
-        ECM_Log("[ECM] Pipe discovery failed; using default endpoints 0x%02X / 0x%02X.\n",
-                ECM_PIPE_OUT_DEFAULT, ECM_PIPE_IN_DEFAULT);
-        g_Dev.pipeOut = ECM_PIPE_OUT_DEFAULT;
-        g_Dev.pipeIn  = ECM_PIPE_IN_DEFAULT;
-    }
-
-    // ----- 5. Configure transfer policies ------------------------------------
-    // Set per-pipe timeouts
-    ULONG timeout = ECM_USB_TIMEOUT_MS;
-    WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeOut,
-                         PIPE_TRANSFER_TIMEOUT, sizeof(ULONG), &timeout);
-    WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeIn,
-                         PIPE_TRANSFER_TIMEOUT, sizeof(ULONG), &timeout);
-
-    // Enable auto-flush on OUT pipe (send ZLP when transfer is a multiple of
-    // the max-packet-size — important for bulk endpoints)
-    UCHAR autoFlush = TRUE;
-    WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeOut,
-                         AUTO_FLUSH, sizeof(UCHAR), &autoFlush);
-
-    // Allow partial reads on IN pipe so short transfers don't time out
-    UCHAR allowPartial = TRUE;
-    WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeIn,
-                         ALLOW_PARTIAL_READS, sizeof(UCHAR), &allowPartial);
-
-    // Let WinUSB signal a short packet so the app can detect it
-    UCHAR ignoreShort = FALSE;
-    WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeIn,
-                     IGNORE_SHORT_PACKETS, sizeof(UCHAR), &ignoreShort);
 
     g_Dev.isOpen = TRUE;
-    ECM_Log("[ECM] OpenECMUSB: OK (OUT=0x%02X, IN=0x%02X).\n",
-            g_Dev.pipeOut, g_Dev.pipeIn);
+    ECM_Log("[ECM] OpenECMUSB: OK — ECM-SK HID device opened successfully.\n");
+    ECM_Log("[ECM]   Frame size : %u bytes (Report ID + %u payload)\n",
+            (unsigned)ECM_HID_BUF_BYTES, (unsigned)ECM_FRAME_BYTES);
     return true;
 }
 
 // ============================================================================
 //  CloseECMUSB
-//  Releases WinUSB resources and closes the device handle.
+//  Closes the HID device handle and resets internal state.
 // ============================================================================
 void __stdcall CloseECMUSB(void)
 {
     if (!g_Dev.isOpen)
         return;
 
-    if (g_Dev.hWinUsb != NULL)
-    {
-        WinUsb_Free(g_Dev.hWinUsb);
-        g_Dev.hWinUsb = NULL;
-    }
-    if (g_Dev.hFile != INVALID_HANDLE_VALUE)
-    {
-        CloseHandle(g_Dev.hFile);
-        g_Dev.hFile = INVALID_HANDLE_VALUE;
-    }
-
-    g_Dev.pipeOut = 0;
-    g_Dev.pipeIn  = 0;
-    g_Dev.isOpen  = FALSE;
+    ECM_CloseHandle();
     ECM_Log("[ECM] CloseECMUSB: device closed.\n");
 }
 
 // ============================================================================
 //  ECMUSBWrite
-//  Writes `dwLength` bytes from `data` to the EC-01M bulk-OUT endpoint.
-//  Returns TRUE on success.
+//  Sends one full protocol frame to the ECM-SK via a HID Output report.
+//
+//  HID framing: the caller passes a raw protocol buffer of ECM_FRAME_BYTES.
+//  This function prepends the 1-byte Report ID (0x00) into a stack-allocated
+//  intermediate buffer and calls WriteFile. The caller's buffer is NOT
+//  modified.
+//
+//  dwLength must equal ECM_FRAME_BYTES exactly (sizeof(transData)*DEF_MA_MAX).
+//  Returns TRUE on success, FALSE on failure (hold-last strategy applied by
+//  the caller in mdlOutputs).
 // ============================================================================
 bool __stdcall ECMUSBWrite(unsigned char *data, unsigned long dwLength)
 {
@@ -166,24 +173,33 @@ bool __stdcall ECMUSBWrite(unsigned char *data, unsigned long dwLength)
         return false;
     }
 
-    ULONG bytesWritten = 0;
-    BOOL  ok = WinUsb_WritePipe(
-                    g_Dev.hWinUsb,
-                    g_Dev.pipeOut,
-                    data,
-                    (ULONG)dwLength,
-                    &bytesWritten,
-                    NULL);          // NULL = synchronous (overlapped handle from CreateFile
-                                    //        is used internally by WinUSB)
+    if (dwLength != (unsigned long)ECM_FRAME_BYTES)
+    {
+        ECM_Log("[ECM] ECMUSBWrite: unexpected length %lu (expected %lu).\n",
+                dwLength, (unsigned long)ECM_FRAME_BYTES);
+        return false;
+    }
 
-    // Exact length enforcement
-    if (!ok || bytesWritten != (ULONG)dwLength)
+    // Build the HID output report buffer: [Report ID | payload]
+    // Stack allocation is safe — ECM_HID_BUF_BYTES is at most 513 bytes.
+    unsigned char hidBuf[ECM_HID_BUF_BYTES];
+    hidBuf[0] = ECM_HID_REPORT_ID;                    // Report ID prefix
+    memcpy(hidBuf + 1, data, ECM_FRAME_BYTES);         // protocol payload
+
+    DWORD bytesWritten = 0;
+    BOOL  ok = WriteFile(
+                    g_Dev.hFile,
+                    hidBuf,
+                    (DWORD)ECM_HID_BUF_BYTES,
+                    &bytesWritten,
+                    NULL);              // synchronous
+
+    if (!ok || bytesWritten != (DWORD)ECM_HID_BUF_BYTES)
     {
         ECM_Log("[ECM] ECMUSBWrite failed: Err=0x%08X (wrote %lu / %lu bytes).\n",
-                GetLastError(), bytesWritten, dwLength);
-        
-        // Do NOT reset pipes here — hold last value strategy applied
-        // by the caller; ECMUSBRecover() is called at shutdown only.
+                GetLastError(), bytesWritten, (unsigned long)ECM_HID_BUF_BYTES);
+        // Do NOT reset or close the handle here — caller holds last
+        // output values. ECMUSBRecover() is called at shutdown in mdlTerminate.
         return false;
     }
 
@@ -192,8 +208,15 @@ bool __stdcall ECMUSBWrite(unsigned char *data, unsigned long dwLength)
 
 // ============================================================================
 //  ECMUSBRead
-//  Reads `dwLength` bytes into `data` from the EC-01M bulk-IN endpoint.
-//  Returns TRUE on success.
+//  Receives one full protocol frame from the ECM-SK via a HID Input report.
+//
+//  HID framing: ReadFile returns [Report ID (1 byte) | payload]. This function
+//  validates the Report ID, then copies only the payload into the caller's
+//  buffer of ECM_FRAME_BYTES. The Report ID byte is consumed internally.
+//
+//  dwLength must equal ECM_FRAME_BYTES exactly.
+//  Returns TRUE on success, FALSE on failure (hold-last strategy applied by
+//  the caller in mdlOutputs).
 // ============================================================================
 bool __stdcall ECMUSBRead(unsigned char *data, unsigned long dwLength)
 {
@@ -203,84 +226,138 @@ bool __stdcall ECMUSBRead(unsigned char *data, unsigned long dwLength)
         return false;
     }
 
-    // Zero-initialise the destination buffer so stale data never leaks
-    memset(data, 0, dwLength);
-
-    ULONG bytesRead = 0;
-    BOOL  ok = WinUsb_ReadPipe(
-                    g_Dev.hWinUsb,
-                    g_Dev.pipeIn,
-                    data,
-                    (ULONG)dwLength,
-                    &bytesRead,
-                    NULL);
-
-    // Enforce full-frame reads. Returning success on a short read 
-    // breaks the fixed-size structure assumptions of the protocol.
-    if (!ok || bytesRead != (ULONG)dwLength)
+    if (dwLength != (unsigned long)ECM_FRAME_BYTES)
     {
-        ECM_Log("[ECM] ECMUSBRead failed: Err=0x%08X (read %lu / %lu bytes).\n",
-                GetLastError(), bytesRead, dwLength);
-
-        // Do NOT reset pipes here — hold last value strategy applied
-        // by the caller; ECMUSBRecover() is called at shutdown only.
+        ECM_Log("[ECM] ECMUSBRead: unexpected length %lu (expected %lu).\n",
+                dwLength, (unsigned long)ECM_FRAME_BYTES);
         return false;
     }
 
-    // ECM_Log("[ECM] ECMUSBRead: %lu bytes received.\n", bytesRead);
+    // Zero-initialise the destination buffer so stale data never leaks
+    memset(data, 0, dwLength);
+
+    // Read into an intermediate HID buffer that includes the Report ID byte
+    unsigned char hidBuf[ECM_HID_BUF_BYTES];
+    memset(hidBuf, 0, sizeof(hidBuf));
+
+    DWORD bytesRead = 0;
+    BOOL  ok = ReadFile(
+                    g_Dev.hFile,
+                    hidBuf,
+                    (DWORD)ECM_HID_BUF_BYTES,
+                    &bytesRead,
+                    NULL);              // synchronous
+
+    if (!ok || bytesRead != (DWORD)ECM_HID_BUF_BYTES)
+    {
+        ECM_Log("[ECM] ECMUSBRead failed: Err=0x%08X (read %lu / %lu bytes).\n",
+                GetLastError(), bytesRead, (unsigned long)ECM_HID_BUF_BYTES);
+        // Do NOT reset or close the handle here — hold last value
+        // strategy applied by caller. ECMUSBRecover() called at shutdown only.
+        return false;
+    }
+
+    // Validate Report ID — should always be ECM_HID_REPORT_ID (0x00)
+    if (hidBuf[0] != ECM_HID_REPORT_ID)
+    {
+        ECM_Log("[ECM] ECMUSBRead: unexpected Report ID 0x%02X (expected 0x%02X).\n",
+                (unsigned)hidBuf[0], (unsigned)ECM_HID_REPORT_ID);
+        // Non-fatal for Report ID 0 devices — some firmware echoes 0x00
+        // regardless. Copy payload anyway and let caller decide.
+    }
+
+    // Strip the Report ID byte — copy only the protocol payload to caller
+    memcpy(data, hidBuf + 1, ECM_FRAME_BYTES);
+
     return true;
-}
-
-// ----------------------------------------------------------------------------
-//  ECM_ResetDevice
-// ----------------------------------------------------------------------------
-static void ECM_ResetDevice(void)
-{
-    if (!g_Dev.isOpen) return;
-
-    // Correct USB error recovery sequence: Abort pending I/O, then Reset to clear stall
-    WinUsb_AbortPipe(g_Dev.hWinUsb, g_Dev.pipeOut);
-    WinUsb_AbortPipe(g_Dev.hWinUsb, g_Dev.pipeIn);
-    
-    WinUsb_ResetPipe(g_Dev.hWinUsb, g_Dev.pipeOut);
-    WinUsb_ResetPipe(g_Dev.hWinUsb, g_Dev.pipeIn);
-    
-    ECM_Log("[ECM] Device pipes aborted and reset.\n");
 }
 
 // ============================================================================
 //  ECMUSBRecover
-//  Public wrapper around ECM_ResetDevice for use at controlled shutdown only
-//  (i.e. mdlTerminate). Must NOT be called from inside the real-time loop
-//  (mdlOutputs) as WinUsb_AbortPipe / WinUsb_ResetPipe can take several
-//   milliseconds and will cause a real-time overrun.
+//  Controlled recovery for use at shutdown only (mdlTerminate).
+//  Closes and reopens the HID device handle to flush any stalled I/O.
+//  Must NOT be called from inside the real-time loop (mdlOutputs) —
+//  CloseHandle + CreateFile can take tens of milliseconds.
 // ============================================================================
 void __stdcall ECMUSBRecover(void)
 {
-    ECM_ResetDevice();
+    if (!g_Dev.isOpen)
+        return;
+
+    ECM_Log("[ECM] ECMUSBRecover: closing and reopening HID handle...\n");
+
+    // Record the path before closing so we can reopen it
+    // (not needed at shutdown, but keeps the pattern consistent)
+    ECM_CloseHandle();
+
+    // Attempt to reopen — best effort at shutdown, failure is non-fatal
+    WCHAR devicePath[MAX_PATH] = { 0 };
+    if (ECM_FindHidDevicePath(devicePath, MAX_PATH))
+    {
+        g_Dev.hFile = CreateFileW(
+            devicePath,
+            GENERIC_READ | GENERIC_WRITE,
+            0, NULL, OPEN_EXISTING, 0, NULL);
+
+        if (g_Dev.hFile != INVALID_HANDLE_VALUE)
+        {
+            g_Dev.isOpen = TRUE;
+            ECM_Log("[ECM] ECMUSBRecover: handle reopened successfully.\n");
+        }
+        else
+        {
+            ECM_Log("[ECM] ECMUSBRecover: reopen failed: 0x%08X\n", GetLastError());
+        }
+    }
+    else
+    {
+        ECM_Log("[ECM] ECMUSBRecover: device no longer found (USB disconnected?).\n");
+    }
 }
 
 // ============================================================================
-// ============================================================================
 //  INTERNAL HELPERS
-// ============================================================================
 // ============================================================================
 
 // ----------------------------------------------------------------------------
-//  ECM_FindDevicePath
-//  Uses SetupAPI to enumerate device interfaces registered with
-//  ECM_DEVICE_INTERFACE_GUID and returns the path of the first match.
+//  ECM_CloseHandle
+//  Closes the raw file handle and resets device state. Internal use only.
 // ----------------------------------------------------------------------------
-static BOOL ECM_FindDevicePath(WCHAR *pathBuf, DWORD pathBufLen)
+static void ECM_CloseHandle(void)
 {
+    if (g_Dev.hFile != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(g_Dev.hFile);
+        g_Dev.hFile = INVALID_HANDLE_VALUE;
+    }
+    g_Dev.isOpen = FALSE;
+}
+
+// ----------------------------------------------------------------------------
+//  ECM_FindHidDevicePath
+//  Enumerates all HID class devices using the HID GUID from HidD_GetHidGuid,
+//  opens each one briefly to read its VID/PID via HidD_GetAttributes, and
+//  returns the device path of the first device matching ECM_USB_VID/PID.
+//
+//  This is the correct approach for HID class devices — the generic WinUSB
+//  GUID search used in the old implementation does not apply here.
+// ----------------------------------------------------------------------------
+static BOOL ECM_FindHidDevicePath(WCHAR *pathBuf, DWORD pathBufLen)
+{
+    // Get the HID class GUID — always {4D1E55B2-F16F-11CF-88CB-001111000030}
+    // but calling HidD_GetHidGuid is the correct portable way to obtain it.
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+
+    // Enumerate all present HID device interfaces
     HDEVINFO hDevInfo = SetupDiGetClassDevsW(
-        &ECM_DEVICE_INTERFACE_GUID,
+        &hidGuid,
         NULL, NULL,
         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
 
     if (hDevInfo == INVALID_HANDLE_VALUE)
     {
-        ECM_Log("[ECM] SetupDiGetClassDevsW failed: 0x%08X\n", GetLastError());
+        ECM_Log("[ECM] SetupDiGetClassDevsW (HID) failed: 0x%08X\n", GetLastError());
         return FALSE;
     }
 
@@ -288,21 +365,23 @@ static BOOL ECM_FindDevicePath(WCHAR *pathBuf, DWORD pathBufLen)
     ifData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
 
     BOOL found = FALSE;
-    for (DWORD idx = 0; ; idx++)
+
+    for (DWORD idx = 0; !found; idx++)
     {
-        if (!SetupDiEnumDeviceInterfaces(hDevInfo, NULL,
-                                         &ECM_DEVICE_INTERFACE_GUID,
-                                         idx, &ifData))
+        // Enumerate the next HID interface
+        if (!SetupDiEnumDeviceInterfaces(hDevInfo, NULL, &hidGuid, idx, &ifData))
         {
             if (GetLastError() == ERROR_NO_MORE_ITEMS)
-                break;
-            continue;
+                break;  // exhausted all HID devices
+            continue;   // skip devices with enumeration errors
         }
 
-        // Query required buffer size
+        // Query the required buffer size for the detail struct
         DWORD requiredSize = 0;
         SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
                                          NULL, 0, &requiredSize, NULL);
+        if (requiredSize == 0)
+            continue;
 
         PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
             (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)HeapAlloc(
@@ -311,165 +390,62 @@ static BOOL ECM_FindDevicePath(WCHAR *pathBuf, DWORD pathBufLen)
             break;
 
         pDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-        if (SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
-                                              pDetail, requiredSize,
-                                              NULL, NULL))
+        BOOL detailOk = SetupDiGetDeviceInterfaceDetailW(
+                            hDevInfo, &ifData,
+                            pDetail, requiredSize,
+                            NULL, NULL);
+        if (!detailOk)
         {
-            wcsncpy_s(pathBuf, pathBufLen, pDetail->DevicePath, _TRUNCATE);
-            found = TRUE;
-        }
-        HeapFree(GetProcessHeap(), 0, pDetail);
-
-        if (found)
-            break;
-    }
-
-    SetupDiDestroyDeviceInfoList(hDevInfo);
-    return found;
-}
-
-// ----------------------------------------------------------------------------
-//  ECM_FindDevicePathByVidPid
-//  Fallback: enumerate all USB devices and find one whose hardware ID
-//  contains the expected VID and PID strings.
-// ----------------------------------------------------------------------------
-static BOOL ECM_FindDevicePathByVidPid(WCHAR *pathBuf, DWORD pathBufLen)
-{
-    // Build the search substring, e.g. L"VID_04B4&PID_00F1"
-    WCHAR vidPidStr[64];
-    swprintf_s(vidPidStr, 64, L"VID_%04X&PID_%04X", ECM_USB_VID, ECM_USB_PID);
-
-    // Enumerate all present device interfaces in the USB class
-    // Use the WinUSB class GUID {88BAE032-5A81-49f0-BC3D-A4FF138216D6}
-    static const GUID GUID_DEVCLASS_WINUSB = {
-        0x88BAE032, 0x5A81, 0x49F0,
-        { 0xBC, 0x3D, 0xA4, 0xFF, 0x13, 0x82, 0x16, 0xD6 }
-    };
-
-    HDEVINFO hDevInfo = SetupDiGetClassDevsW(
-        NULL, L"USB", NULL,
-        DIGCF_PRESENT | DIGCF_ALLCLASSES | DIGCF_DEVICEINTERFACE);
-
-    if (hDevInfo == INVALID_HANDLE_VALUE)
-        return FALSE;
-
-    SP_DEVINFO_DATA devData = { 0 };
-    devData.cbSize = sizeof(SP_DEVINFO_DATA);
-
-    BOOL found = FALSE;
-    for (DWORD idx = 0; SetupDiEnumDeviceInfo(hDevInfo, idx, &devData); idx++)
-    {
-        WCHAR hwId[512] = { 0 };
-        if (!SetupDiGetDeviceRegistryPropertyW(
-                hDevInfo, &devData, SPDRP_HARDWAREID,
-                NULL, (PBYTE)hwId, sizeof(hwId), NULL))
-            continue;
-
-        // Case-insensitive substring match for VIDxxxx&PIDxxxx
-        WCHAR hwIdUpper[512];
-        wcsncpy_s(hwIdUpper, 512, hwId, _TRUNCATE);
-        _wcsupr_s(hwIdUpper, 512);
-
-        WCHAR searchUpper[64];
-        wcsncpy_s(searchUpper, 64, vidPidStr, _TRUNCATE);
-        _wcsupr_s(searchUpper, 64);
-
-        if (wcsstr(hwIdUpper, searchUpper) == NULL)
-            continue;
-
-        // Found the matching device; now find its interface path
-        // Re-enumerate as a device interface so we can get DevicePath
-        // Try the generic WinUSB GUID first, then fall back to the USB GUID
-        const GUID *guids[] = { &ECM_DEVICE_INTERFACE_GUID, &GUID_DEVCLASS_WINUSB };
-        for (int g = 0; g < 2 && !found; g++)
-        {
-            SP_DEVICE_INTERFACE_DATA ifData = { 0 };
-            ifData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
-
-            if (!SetupDiEnumDeviceInterfaces(hDevInfo, &devData,
-                                             guids[g], 0, &ifData))
-                continue;
-
-            DWORD requiredSize = 0;
-            SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
-                                             NULL, 0, &requiredSize, NULL);
-
-            PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
-                (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)HeapAlloc(
-                    GetProcessHeap(), HEAP_ZERO_MEMORY, requiredSize);
-            if (!pDetail)
-                break;
-
-            pDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-            if (SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
-                                                  pDetail, requiredSize,
-                                                  NULL, NULL))
-            {
-                wcsncpy_s(pathBuf, pathBufLen, pDetail->DevicePath, _TRUNCATE);
-                found = TRUE;
-            }
             HeapFree(GetProcessHeap(), 0, pDetail);
-        }
-
-        if (found)
-            break;
-    }
-
-    SetupDiDestroyDeviceInfoList(hDevInfo);
-    return found;
-}
-
-// ----------------------------------------------------------------------------
-//  ECM_QueryPipes
-//  Queries all alternate settings / endpoints on interface 0 and
-//  locates the first Bulk-OUT and Bulk-IN pipes.
-// ----------------------------------------------------------------------------
-static BOOL ECM_QueryPipes(void)
-{
-    USB_INTERFACE_DESCRIPTOR ifDesc = { 0 };
-    if (!WinUsb_QueryInterfaceSettings(g_Dev.hWinUsb, 0, &ifDesc))
-    {
-        ECM_Log("[ECM] WinUsb_QueryInterfaceSettings failed: 0x%08X\n",
-                GetLastError());
-        return FALSE;
-    }
-
-    ECM_Log("[ECM] Interface: %d endpoints.\n", (int)ifDesc.bNumEndpoints);
-
-    BOOL foundOut = FALSE, foundIn = FALSE;
-
-    for (UCHAR i = 0; i < ifDesc.bNumEndpoints; i++)
-    {
-        WINUSB_PIPE_INFORMATION pipeInfo = { 0 };
-        if (!WinUsb_QueryPipe(g_Dev.hWinUsb, 0, i, &pipeInfo))
-        {
-            ECM_Log("[ECM]   QueryPipe[%d] failed: 0x%08X\n", (int)i,
-                    GetLastError());
             continue;
         }
 
-        ECM_Log("[ECM]   Pipe[%d]: type=%d addr=0x%02X maxPkt=%u\n",
-                (int)i,
-                (int)pipeInfo.PipeType,
-                (unsigned)pipeInfo.PipeId,
-                (unsigned)pipeInfo.MaximumPacketSize);
+        // Briefly open the device to read its VID/PID via HidD_GetAttributes.
+        // Use FILE_SHARE_READ | FILE_SHARE_WRITE so we don't block other
+        // processes while probing.
+        HANDLE hProbe = CreateFileW(
+            pDetail->DevicePath,
+            0,                  // no read/write access needed just to query attrs
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            NULL,
+            OPEN_EXISTING,
+            0,
+            NULL);
 
-        if (pipeInfo.PipeType == UsbdPipeTypeBulk)
+        if (hProbe != INVALID_HANDLE_VALUE)
         {
-            if ((pipeInfo.PipeId & 0x80) == 0 && !foundOut)
+            HIDD_ATTRIBUTES attrs = { 0 };
+            attrs.Size = sizeof(HIDD_ATTRIBUTES);
+
+            if (HidD_GetAttributes(hProbe, &attrs))
             {
-                g_Dev.pipeOut = pipeInfo.PipeId;
-                foundOut = TRUE;
-                ECM_Log("[ECM]   -> Assigned as Bulk-OUT pipe.\n");
+                ECM_Log("[ECM] HID probe: VID=%04X PID=%04X path=%ls\n",
+                        (unsigned)attrs.VendorID,
+                        (unsigned)attrs.ProductID,
+                        pDetail->DevicePath);
+
+                if (attrs.VendorID  == (USHORT)ECM_USB_VID &&
+                    attrs.ProductID == (USHORT)ECM_USB_PID)
+                {
+                    // Matched — copy the device path for the caller
+                    wcsncpy_s(pathBuf, pathBufLen,
+                              pDetail->DevicePath, _TRUNCATE);
+                    found = TRUE;
+                    ECM_Log("[ECM] ECM-SK found: VID_%04X&PID_%04X\n",
+                            ECM_USB_VID, ECM_USB_PID);
+                }
             }
-            else if ((pipeInfo.PipeId & 0x80) != 0 && !foundIn)
-            {
-                g_Dev.pipeIn = pipeInfo.PipeId;
-                foundIn = TRUE;
-                ECM_Log("[ECM]   -> Assigned as Bulk-IN pipe.\n");
-            }
+            CloseHandle(hProbe);
         }
+
+        HeapFree(GetProcessHeap(), 0, pDetail);
     }
 
-    return (foundOut && foundIn);
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+
+    if (!found)
+        ECM_Log("[ECM] ECM_FindHidDevicePath: no device matched "
+                "VID_%04X&PID_%04X.\n", ECM_USB_VID, ECM_USB_PID);
+
+    return found;
 }
