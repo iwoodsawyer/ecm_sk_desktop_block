@@ -11,17 +11,18 @@
 #include <hidsdi.h>      // HidD_GetHidGuid, HidD_GetAttributes, HidD_GetProductString
 #include <hidusage.h>
 #include <devpkey.h>
+#include <cstdarg>       // va_list, va_start, va_end
 #include <cstdio>
 #include <cstring>
 #include <cassert>
 
 // --------------------------------------------------------------------------
 // EC-01M USB Device Identity
-// Vendor ID  : 0x16C0  (Van Ooijen Technische Informatica â€” V-USB shared VID)
-// Product ID : 0x05DF  (Generic HID device â€” not mice/keyboards/joysticks)
+// Vendor ID  : 0x16C0  (Van Ooijen Technische Informatica — V-USB shared VID)
+// Product ID : 0x05DF  (Generic HID device — not mice/keyboards/joysticks)
 //
 // The ECM-SK enumerates as a USB HID class device under HidUsb.sys.
-// No Zadig / driver replacement is needed â€” Windows installs HidUsb.sys
+// No Zadig / driver replacement is needed — Windows installs HidUsb.sys
 // automatically on first connection.
 // --------------------------------------------------------------------------
 #define ECM_USB_VID              0x16C0
@@ -36,8 +37,10 @@
 #define ECM_HID_REPORT_ID        0x00
 
 // --------------------------------------------------------------------------
-// Timeout for USB transfers (milliseconds)
-// Applies to the synchronous ReadFile / WriteFile calls via HidD timeouts.
+// Timeout for USB read transfers (milliseconds).
+// ECMUSBRead opens the file handle with FILE_FLAG_OVERLAPPED and uses
+// WaitForSingleObject to enforce this limit.  A stalled or disconnected
+// device cannot block the real-time thread beyond this interval.
 // --------------------------------------------------------------------------
 #define ECM_USB_TIMEOUT_MS       3000
 
