@@ -37,10 +37,12 @@
 #define ECM_HID_REPORT_ID        0x00
 
 // --------------------------------------------------------------------------
-// Timeout for USB read transfers (milliseconds).
-// ECMUSBRead opens the file handle with FILE_FLAG_OVERLAPPED and uses
-// WaitForSingleObject to enforce this limit.  A stalled or disconnected
-// device cannot block the real-time thread beyond this interval.
+// Timeout for USB transfers (milliseconds).
+// Applied to both ECMUSBRead and ECMUSBWrite via WaitForSingleObject.
+// The device handle is opened with FILE_FLAG_OVERLAPPED so that both
+// ReadFile and WriteFile can be issued with an OVERLAPPED struct and
+// cancelled via CancelIoEx if this deadline is exceeded.  A stalled or
+// disconnected device cannot block the real-time thread beyond this limit.
 // --------------------------------------------------------------------------
 #define ECM_USB_TIMEOUT_MS       3000
 
@@ -48,8 +50,19 @@
 // Internal device state (one global instance)
 // --------------------------------------------------------------------------
 typedef struct _ECM_DEVICE_CTX {
-    HANDLE   hFile;      // CreateFile handle to the HID device
-    BOOL     isOpen;     // TRUE while device is open
+    HANDLE   hFile;                  // CreateFile handle to the HID device
+    BOOL     isOpen;                 // TRUE while device is open
+    HANDLE   hEventRead;             // Manual-reset event for overlapped reads.
+                                     // Allocated once in OpenECMUSB, freed in
+                                     // ECM_CloseHandle. ResetEvent() before each
+                                     // ReadFile call to avoid per-tick kernel alloc.
+    HANDLE   hEventWrite;            // Manual-reset event for overlapped writes.
+                                     // Same lifetime and usage as hEventRead.
+    WCHAR    devicePath[MAX_PATH];   // Exact path used when the device was opened.
+                                     // Cached so ECMUSBRecover can reopen the same
+                                     // physical device without re-enumerating —
+                                     // critical when multiple ECM-SK modules are
+                                     // connected simultaneously.
 } ECM_DEVICE_CTX;
 
 // --------------------------------------------------------------------------

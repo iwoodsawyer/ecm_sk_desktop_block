@@ -25,6 +25,18 @@
 //   12-byte variant: 1 + 12*42 = 505 bytes
 //   16-byte variant: 1 + 16*32 = 513 bytes
 //
+// Overlapped I/O model:
+//   The handle is opened with FILE_FLAG_OVERLAPPED. Under the Windows API,
+//   ALL ReadFile and WriteFile calls on an overlapped handle MUST supply a
+//   valid non-NULL OVERLAPPED structure — passing NULL causes the call to fail
+//   with ERROR_INVALID_PARAMETER or produces undefined I/O driver behaviour
+//   because the kernel and Win32 completion signalling mechanisms are put out
+//   of phase. Both ECMUSBRead and ECMUSBWrite therefore use an OVERLAPPED
+//   struct whose hEvent is a manual-reset event allocated once at open time
+//   (g_Dev.hEventRead / g_Dev.hEventWrite) and reset with ResetEvent() before
+//   each transfer. This eliminates per-tick kernel object allocation overhead
+//   that would otherwise introduce jitter into the real-time cycle.
+//
 // Build requirements:
 //   - Link: hid.lib, setupapi.lib
 //   - SDK:  Windows SDK 8.1 or later
@@ -51,7 +63,7 @@
 // ============================================================================
 // Module-level state
 // ============================================================================
-static ECM_DEVICE_CTX g_Dev = { INVALID_HANDLE_VALUE, FALSE };
+static ECM_DEVICE_CTX g_Dev = { INVALID_HANDLE_VALUE, FALSE, NULL, NULL, { 0 } };
 
 // ============================================================================
 // Forward declarations of internal helpers
@@ -61,9 +73,10 @@ static void ECM_CloseHandle(void);
 
 // ============================================================================
 //  OpenECMUSB
-//  Locates the ECM-SK HID device by VID/PID, opens an exclusive file handle,
-//  and configures read/write timeouts.
-//  Returns TRUE on success, FALSE on any failure.
+//  Locates the ECM-SK HID device by VID/PID, opens an exclusive overlapped
+//  file handle, allocates the shared read/write OVERLAPPED events, and
+//  caches the device path for use by ECMUSBRecover.
+//  Returns true on success, false on any failure.
 // ============================================================================
 bool __stdcall OpenECMUSB(void)
 {
@@ -83,19 +96,27 @@ bool __stdcall OpenECMUSB(void)
     }
     ECM_Log("[ECM] HID device path: %ls\n", devicePath);
 
+    // Cache the exact path now, before opening, so ECMUSBRecover can reopen
+    // the same physical device without re-enumerating.  This is critical when
+    // multiple ECM-SK modules are connected: re-enumeration might return a
+    // different unit at a different enumeration index.
+    wcsncpy_s(g_Dev.devicePath, MAX_PATH, devicePath, _TRUNCATE);
+
     // ----- 2. Open the HID device -------------------------------------------
-    // FILE_FLAG_OVERLAPPED is required so ECMUSBRead can issue a ReadFile with
-    // an OVERLAPPED struct and use WaitForSingleObject to enforce
-    // ECM_USB_TIMEOUT_MS.  Without this flag a stalled or disconnected device
-    // would block the real-time thread indefinitely.
+    // FILE_FLAG_OVERLAPPED is required so that both ECMUSBRead and ECMUSBWrite
+    // can supply a valid OVERLAPPED struct to ReadFile/WriteFile and enforce
+    // ECM_USB_TIMEOUT_MS via WaitForSingleObject + CancelIoEx.
+    // Under the Windows API, ALL I/O on an overlapped handle MUST use a
+    // non-NULL OVERLAPPED — passing NULL would cause ERROR_INVALID_PARAMETER
+    // or silent undefined behaviour from the I/O manager.
     g_Dev.hFile = CreateFileW(
         devicePath,
         GENERIC_READ | GENERIC_WRITE,
-        0,              // exclusive: do not share — prevents other processes
-                        // from interfering with the EtherCAT master traffic
+        0,                      // exclusive: do not share — prevents other
+                                // processes from interfering with EtherCAT traffic
         NULL,
         OPEN_EXISTING,
-        FILE_FLAG_OVERLAPPED,   // required for timeout-bounded reads
+        FILE_FLAG_OVERLAPPED,   // required for timeout-bounded read and write
         NULL);
 
     if (g_Dev.hFile == INVALID_HANDLE_VALUE)
@@ -103,23 +124,38 @@ bool __stdcall OpenECMUSB(void)
         DWORD err = GetLastError();
         if (err == ERROR_ACCESS_DENIED)
             ECM_Log("[ECM] OpenECMUSB: access denied — device may be open by "
-                    "another process.\n");
+                    "another process, or this is a protected system HID device.\n");
         else
             ECM_Log("[ECM] OpenECMUSB: CreateFile failed: 0x%08X\n", err);
         return false;
     }
 
-    // ----- 3. Configure HID read timeouts -----------------------------------
+    // ----- 3. Allocate shared OVERLAPPED events -----------------------------
+    // One manual-reset event per transfer direction, allocated here and freed
+    // in ECM_CloseHandle.  Using persistent events and calling ResetEvent()
+    // before each transfer avoids CreateEvent/CloseHandle overhead inside the
+    // real-time cycle, which would otherwise introduce kernel scheduling jitter
+    // at every tick.  The events must be manual-reset: calling GetOverlappedResult
+    // after WaitForSingleObject requires the event to still be signalled so that
+    // GetOverlappedResult can observe it; an auto-reset event can be cleared by
+    // the wait before GetOverlappedResult reads it, causing a deadlock.
+    g_Dev.hEventRead  = CreateEvent(NULL, TRUE, FALSE, NULL);
+    g_Dev.hEventWrite = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    if (g_Dev.hEventRead == NULL || g_Dev.hEventWrite == NULL)
+    {
+        ECM_Log("[ECM] OpenECMUSB: CreateEvent failed: 0x%08X\n", GetLastError());
+        if (g_Dev.hEventRead)  { CloseHandle(g_Dev.hEventRead);  g_Dev.hEventRead  = NULL; }
+        if (g_Dev.hEventWrite) { CloseHandle(g_Dev.hEventWrite); g_Dev.hEventWrite = NULL; }
+        CloseHandle(g_Dev.hFile);
+        g_Dev.hFile = INVALID_HANDLE_VALUE;
+        return false;
+    }
+
+    // ----- 4. Configure HID input buffer depth ------------------------------
     // HidD_SetNumInputBuffers controls how many input reports Windows queues
     // internally before they are overwritten. A small queue (2) prevents stale
-    // reports accumulating between real-time ticks. The actual transfer timeout
-    // is controlled by setting a timeout on the file handle via
-    // SetCommTimeouts is only for COM ports; for HID we use a manual approach:
-    // we keep synchronous I/O and accept that ReadFile will block for at most
-    // one USB poll interval (1 ms) plus OS scheduling jitter.
-    //
-    // For deterministic timeout behaviour, ECMUSBRead uses WaitForSingleObject
-    // with an overlapped read — see ECMUSBRead implementation note below.
+    // reports accumulating between real-time ticks.
     if (!HidD_SetNumInputBuffers(g_Dev.hFile, 2))
     {
         ECM_Log("[ECM] HidD_SetNumInputBuffers failed: 0x%08X (non-fatal)\n",
@@ -136,7 +172,8 @@ bool __stdcall OpenECMUSB(void)
 
 // ============================================================================
 //  CloseECMUSB
-//  Closes the HID device handle and resets internal state.
+//  Closes the HID device handle, frees the shared OVERLAPPED events, and
+//  resets internal state.
 // ============================================================================
 void __stdcall CloseECMUSB(void)
 {
@@ -156,8 +193,14 @@ void __stdcall CloseECMUSB(void)
 //  intermediate buffer and calls WriteFile. The caller's buffer is NOT
 //  modified.
 //
+//  Overlapped I/O: WriteFile is issued with the shared g_Dev.hEventWrite
+//  OVERLAPPED event (reset before the call). If the write does not complete
+//  immediately, WaitForSingleObject enforces ECM_USB_TIMEOUT_MS before
+//  giving up and cancelling. This mirrors the read path and ensures a stalled
+//  interrupt-OUT endpoint cannot block the real-time thread.
+//
 //  dwLength must equal ECM_FRAME_BYTES exactly (sizeof(transData)*DEF_MA_MAX).
-//  Returns TRUE on success, FALSE on failure (hold-last strategy applied by
+//  Returns true on success, false on failure (hold-last strategy applied by
 //  the caller in mdlOutputs).
 // ============================================================================
 bool __stdcall ECMUSBWrite(const unsigned char *data, unsigned long dwLength)
@@ -178,28 +221,98 @@ bool __stdcall ECMUSBWrite(const unsigned char *data, unsigned long dwLength)
     // Build the HID output report buffer: [Report ID | payload]
     // Stack allocation is safe — ECM_HID_BUF_BYTES is at most 513 bytes.
     unsigned char hidBuf[ECM_HID_BUF_BYTES];
-    hidBuf[0] = ECM_HID_REPORT_ID;                    // Report ID prefix
-    memcpy(hidBuf + 1, data, ECM_FRAME_BYTES);         // protocol payload
+    hidBuf[0] = ECM_HID_REPORT_ID;            // Report ID prefix
+    memcpy(hidBuf + 1, data, ECM_FRAME_BYTES); // protocol payload
 
+    // Reset the shared write event before issuing the transfer so that any
+    // signal left over from a previous tick does not cause a false-completion.
+    ResetEvent(g_Dev.hEventWrite);
+
+    OVERLAPPED ov  = { 0 };
+    ov.hEvent      = g_Dev.hEventWrite;
+
+    // lpNumberOfBytesWritten must be NULL when using an overlapped handle —
+    // passing a non-NULL pointer here can produce erroneous byte counts on
+    // some Windows versions. Actual count is retrieved via GetOverlappedResult.
     DWORD bytesWritten = 0;
     BOOL  ok = WriteFile(g_Dev.hFile, hidBuf, (DWORD)ECM_HID_BUF_BYTES,
-                         &bytesWritten, NULL);   // write direction is safe to block briefly
+                         NULL, &ov);
 
-    if (!ok || bytesWritten != (DWORD)ECM_HID_BUF_BYTES)
+    if (!ok)
     {
-        ECM_Log("[ECM] ECMUSBWrite failed: Err=0x%08X (wrote %lu / %lu bytes).\n",
-                GetLastError(), bytesWritten, (unsigned long)ECM_HID_BUF_BYTES);
-        // Do NOT reset or close the handle here — caller holds last
-        // output values. ECMUSBRecover() is called at shutdown in mdlTerminate.
+        DWORD err = GetLastError();
+        if (err != ERROR_IO_PENDING)
+        {
+            ECM_Log("[ECM] ECMUSBWrite: WriteFile failed immediately: 0x%08X\n", err);
+            // Do NOT close or reset the handle — caller applies hold-last strategy.
+            // ECMUSBRecover() is called at shutdown in mdlTerminate.
+            return false;
+        }
+
+        // Wait up to ECM_USB_TIMEOUT_MS for the write to complete.
+        // Using WaitForSingleObject + GetOverlappedResult(bWait=FALSE) rather
+        // than GetOverlappedResult(bWait=TRUE) because the latter blocks
+        // indefinitely on a manual-reset event if I/O never completes — which
+        // would reintroduce the very stall this overlapped model was designed
+        // to prevent.
+        DWORD waitResult = WaitForSingleObject(g_Dev.hEventWrite, ECM_USB_TIMEOUT_MS);
+        if (waitResult != WAIT_OBJECT_0)
+        {
+            // Cancel the pending write and drain its completion so the
+            // OVERLAPPED and its event are safe to reuse next tick.
+            CancelIoEx(g_Dev.hFile, &ov);
+            GetOverlappedResult(g_Dev.hFile, &ov, &bytesWritten, TRUE); // drain
+            if (waitResult == WAIT_TIMEOUT)
+                ECM_Log("[ECM] ECMUSBWrite: timed out after %u ms — "
+                        "device stalled or disconnected?\n", ECM_USB_TIMEOUT_MS);
+            else
+                ECM_Log("[ECM] ECMUSBWrite: WaitForSingleObject error: 0x%08X\n",
+                        GetLastError());
+            return false;
+        }
+
+        // I/O completed within the timeout — retrieve the byte count.
+        if (!GetOverlappedResult(g_Dev.hFile, &ov, &bytesWritten, FALSE))
+        {
+            ECM_Log("[ECM] ECMUSBWrite: GetOverlappedResult failed: 0x%08X\n",
+                    GetLastError());
+            return false;
+        }
+    }
+    else
+    {
+        // WriteFile completed synchronously (can happen even on an overlapped
+        // handle when data is already buffered). Retrieve the byte count the
+        // same way for consistency.
+        GetOverlappedResult(g_Dev.hFile, &ov, &bytesWritten, FALSE);
+    }
+
+    if (bytesWritten != (DWORD)ECM_HID_BUF_BYTES)
+    {
+        ECM_Log("[ECM] ECMUSBWrite: short write — sent %lu / %lu bytes.\n",
+                bytesWritten, (unsigned long)ECM_HID_BUF_BYTES);
         return false;
     }
+
     return true;
 }
 
 // ============================================================================
 //  ECMUSBRead
-//  Uses overlapped I/O + WaitForSingleObject to enforce ECM_USB_TIMEOUT_MS.
-//  A stalled or disconnected device cannot block the caller indefinitely.
+//  Receives one full protocol frame from the ECM-SK via a HID Input report.
+//
+//  HID framing: ReadFile returns [Report ID (1 byte) | payload]. This function
+//  validates the Report ID, then copies only the payload into the caller's
+//  buffer of ECM_FRAME_BYTES. The Report ID byte is consumed internally.
+//
+//  Overlapped I/O: ReadFile is issued with the shared g_Dev.hEventRead
+//  OVERLAPPED event (reset before the call). WaitForSingleObject enforces
+//  ECM_USB_TIMEOUT_MS; on timeout CancelIoEx cancels the pending read and
+//  drains its completion before returning false, so the event and OVERLAPPED
+//  are safe to reuse on the next tick without kernel object reallocation.
+//
+//  dwLength must equal ECM_FRAME_BYTES exactly.
+//  Returns true on success, false on timeout or failure.
 // ============================================================================
 bool __stdcall ECMUSBRead(unsigned char *data, unsigned long dwLength)
 {
@@ -223,18 +336,16 @@ bool __stdcall ECMUSBRead(unsigned char *data, unsigned long dwLength)
     unsigned char hidBuf[ECM_HID_BUF_BYTES];
     memset(hidBuf, 0, sizeof(hidBuf));
 
-    // --- Overlapped read with explicit timeout ---
+    // Reset the shared read event before issuing the transfer so that a
+    // signal left over from a previous tick does not cause a false-completion.
+    ResetEvent(g_Dev.hEventRead);
+
     OVERLAPPED ov = { 0 };
-    ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);   // manual-reset, non-signalled
-    if (ov.hEvent == NULL)
-    {
-        ECM_Log("[ECM] ECMUSBRead: CreateEvent failed: 0x%08X\n", GetLastError());
-        return false;
-    }
+    ov.hEvent     = g_Dev.hEventRead;
 
     DWORD bytesRead = 0;
     BOOL  ok = ReadFile(g_Dev.hFile, hidBuf, (DWORD)ECM_HID_BUF_BYTES,
-                        &bytesRead, &ov);
+                        NULL, &ov); // lpNumberOfBytesRead = NULL on overlapped handle
 
     if (!ok)
     {
@@ -242,37 +353,40 @@ bool __stdcall ECMUSBRead(unsigned char *data, unsigned long dwLength)
         if (err != ERROR_IO_PENDING)
         {
             ECM_Log("[ECM] ECMUSBRead: ReadFile failed immediately: 0x%08X\n", err);
-            CloseHandle(ov.hEvent);
             return false;
         }
 
         // Wait up to ECM_USB_TIMEOUT_MS for the report to arrive
-        DWORD waitResult = WaitForSingleObject(ov.hEvent, ECM_USB_TIMEOUT_MS);
+        DWORD waitResult = WaitForSingleObject(g_Dev.hEventRead, ECM_USB_TIMEOUT_MS);
         if (waitResult != WAIT_OBJECT_0)
         {
-            // Cancel the pending I/O and drain the completion
+            // Cancel the pending read and drain its completion so the shared
+            // event and OVERLAPPED are safe to reuse on the next tick.
             CancelIoEx(g_Dev.hFile, &ov);
-            GetOverlappedResult(g_Dev.hFile, &ov, &bytesRead, TRUE);
+            GetOverlappedResult(g_Dev.hFile, &ov, &bytesRead, TRUE); // drain
             if (waitResult == WAIT_TIMEOUT)
                 ECM_Log("[ECM] ECMUSBRead: timed out after %u ms — "
                         "device stalled or disconnected?\n", ECM_USB_TIMEOUT_MS);
             else
                 ECM_Log("[ECM] ECMUSBRead: WaitForSingleObject error: 0x%08X\n",
                         GetLastError());
-            CloseHandle(ov.hEvent);
             return false;
         }
 
+        // I/O completed within the timeout — retrieve the byte count.
         if (!GetOverlappedResult(g_Dev.hFile, &ov, &bytesRead, FALSE))
         {
             ECM_Log("[ECM] ECMUSBRead: GetOverlappedResult failed: 0x%08X\n",
                     GetLastError());
-            CloseHandle(ov.hEvent);
             return false;
         }
     }
-
-    CloseHandle(ov.hEvent);
+    else
+    {
+        // ReadFile completed synchronously (data was already queued in the
+        // HID input buffer). Retrieve the byte count for the check below.
+        GetOverlappedResult(g_Dev.hFile, &ov, &bytesRead, FALSE);
+    }
 
     if (bytesRead != (DWORD)ECM_HID_BUF_BYTES)
     {
@@ -289,6 +403,7 @@ bool __stdcall ECMUSBRead(unsigned char *data, unsigned long dwLength)
         // Non-fatal for Report ID 0 devices — some firmware echoes 0x00
         // regardless. Copy payload anyway and let caller decide.
     }
+
     // Strip the Report ID byte — copy only the protocol payload to caller
     memcpy(data, hidBuf + 1, ECM_FRAME_BYTES);
     return true;
@@ -296,9 +411,12 @@ bool __stdcall ECMUSBRead(unsigned char *data, unsigned long dwLength)
 
 // ============================================================================
 //  ECMUSBRecover
-//  Closes the HID handle to flush stalled I/O, then attempts to reopen.
-//  For use in mdlTerminate (shutdown) only — CloseHandle + CreateFile can
-//  take tens of milliseconds and must not be called from the RT loop.
+//  Closes the HID handle to flush any stalled I/O state, then reopens it
+//  using the cached g_Dev.devicePath — bypassing re-enumeration to guarantee
+//  the same physical device is targeted even when multiple ECM-SK modules
+//  are connected simultaneously.
+//  Intended for use in mdlTerminate (shutdown) only; CloseHandle + CreateFile
+//  can take tens of milliseconds and must NOT be called from the RT loop.
 //  The handle will be closed again by CloseECMUSB before mdlTerminate returns.
 // ============================================================================
 void __stdcall ECMUSBRecover(void)
@@ -307,35 +425,44 @@ void __stdcall ECMUSBRecover(void)
         return;
 
     ECM_Log("[ECM] ECMUSBRecover: closing HID handle to flush stalled I/O...\n");
-    // Record the path before closing so we can reopen it
-    // (not needed at shutdown, but keeps the pattern consistent)
+
+    // ECM_CloseHandle frees the file handle AND both OVERLAPPED events.
+    // g_Dev.devicePath is preserved — it is intentionally not cleared by
+    // ECM_CloseHandle so we can reopen here without re-enumerating.
     ECM_CloseHandle();
 
-    // Attempt to reopen — best effort at shutdown, failure is non-fatal
-    WCHAR devicePath[MAX_PATH] = { 0 };
-    if (ECM_FindHidDevicePath(devicePath, MAX_PATH))
-    {
-        g_Dev.hFile = CreateFileW(
-            devicePath,
-            GENERIC_READ | GENERIC_WRITE,
-            0, NULL, OPEN_EXISTING,
-            FILE_FLAG_OVERLAPPED,   // consistent with OpenECMUSB
-            NULL);
+    // Attempt to reopen using the exact path from the original open — best
+    // effort at shutdown, failure is non-fatal.
+    g_Dev.hFile = CreateFileW(
+        g_Dev.devicePath,
+        GENERIC_READ | GENERIC_WRITE,
+        0, NULL, OPEN_EXISTING,
+        FILE_FLAG_OVERLAPPED,   // consistent with OpenECMUSB
+        NULL);
 
-        if (g_Dev.hFile != INVALID_HANDLE_VALUE)
-        {
-            g_Dev.isOpen = TRUE;
-            ECM_Log("[ECM] ECMUSBRecover: handle reopened successfully.\n");
-        }
-        else
-        {
-            ECM_Log("[ECM] ECMUSBRecover: reopen failed: 0x%08X\n", GetLastError());
-        }
-    }
-    else
+    if (g_Dev.hFile == INVALID_HANDLE_VALUE)
     {
-        ECM_Log("[ECM] ECMUSBRecover: device no longer found (USB disconnected?).\n");
+        ECM_Log("[ECM] ECMUSBRecover: reopen failed: 0x%08X "
+                "(device disconnected?)\n", GetLastError());
+        return;
     }
+
+    // Reallocate the OVERLAPPED events for the reopened handle
+    g_Dev.hEventRead  = CreateEvent(NULL, TRUE, FALSE, NULL);
+    g_Dev.hEventWrite = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+    if (g_Dev.hEventRead == NULL || g_Dev.hEventWrite == NULL)
+    {
+        ECM_Log("[ECM] ECMUSBRecover: CreateEvent failed: 0x%08X\n", GetLastError());
+        if (g_Dev.hEventRead)  { CloseHandle(g_Dev.hEventRead);  g_Dev.hEventRead  = NULL; }
+        if (g_Dev.hEventWrite) { CloseHandle(g_Dev.hEventWrite); g_Dev.hEventWrite = NULL; }
+        CloseHandle(g_Dev.hFile);
+        g_Dev.hFile = INVALID_HANDLE_VALUE;
+        return;
+    }
+
+    g_Dev.isOpen = TRUE;
+    ECM_Log("[ECM] ECMUSBRecover: handle reopened successfully.\n");
 }
 
 // ============================================================================
@@ -344,7 +471,10 @@ void __stdcall ECMUSBRecover(void)
 
 // ----------------------------------------------------------------------------
 //  ECM_CloseHandle
-//  Closes the raw file handle and resets device state. Internal use only.
+//  Closes the raw file handle, frees both shared OVERLAPPED events, and
+//  resets device state. Internal use only.
+//  NOTE: g_Dev.devicePath is intentionally NOT cleared here so that
+//  ECMUSBRecover can reopen the same device path after calling this function.
 // ----------------------------------------------------------------------------
 static void ECM_CloseHandle(void)
 {
@@ -353,13 +483,32 @@ static void ECM_CloseHandle(void)
         CloseHandle(g_Dev.hFile);
         g_Dev.hFile = INVALID_HANDLE_VALUE;
     }
+
+    // Free the shared OVERLAPPED events
+    if (g_Dev.hEventRead != NULL)
+    {
+        CloseHandle(g_Dev.hEventRead);
+        g_Dev.hEventRead = NULL;
+    }
+    if (g_Dev.hEventWrite != NULL)
+    {
+        CloseHandle(g_Dev.hEventWrite);
+        g_Dev.hEventWrite = NULL;
+    }
+
     g_Dev.isOpen = FALSE;
+    // g_Dev.devicePath intentionally preserved — ECMUSBRecover reads it after
+    // calling ECM_CloseHandle to reopen the same physical device.
 }
 
 // ----------------------------------------------------------------------------
 //  ECM_FindHidDevicePath
-//  Enumerates HID devices, opens each to check VID/PID, and returns the
-//  device path of the first match.
+//  Enumerates all HID class devices using the HID GUID from HidD_GetHidGuid,
+//  opens each one briefly to read its VID/PID via HidD_GetAttributes, and
+//  returns the device path of the first device matching ECM_USB_VID/PID.
+//
+//  This is the correct approach for HID class devices — the generic WinUSB
+//  GUID search used in earlier revisions of this code does not apply here.
 //
 //  If the matched device path is longer than pathBufLen, the function logs
 //  a clear error and returns FALSE instead of silently truncating — a
@@ -426,7 +575,8 @@ static BOOL ECM_FindHidDevicePath(WCHAR *pathBuf, DWORD pathBufLen)
         // processes while probing.
         HANDLE hProbe = CreateFileW(
             pDetail->DevicePath,
-            0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            0,                  // no read/write access needed just to query attrs
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
             NULL, OPEN_EXISTING, 0, NULL);
 
         if (hProbe != INVALID_HANDLE_VALUE)
@@ -443,8 +593,12 @@ static BOOL ECM_FindHidDevicePath(WCHAR *pathBuf, DWORD pathBufLen)
                 if (attrs.VendorID  == (USHORT)ECM_USB_VID &&
                     attrs.ProductID == (USHORT)ECM_USB_PID)
                 {
-                    // Verify path fits before copying — no silent truncation
-                    size_t pathLen = wcslen(pDetail->DevicePath) + 1;
+                    // Verify the path fits in the caller's buffer before
+                    // copying.  If not, log a clear diagnostic and abort
+                    // rather than silently truncating — a truncated path
+                    // passed to CreateFileW produces a confusing downstream
+                    // failure rather than a clear "path too long" error.
+                    size_t pathLen = wcslen(pDetail->DevicePath) + 1; // +1 for NUL
                     if (pathLen > (size_t)pathBufLen)
                     {
                         ECM_Log("[ECM] ECM_FindHidDevicePath: device path too long "
