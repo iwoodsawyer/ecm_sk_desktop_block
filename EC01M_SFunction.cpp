@@ -143,32 +143,29 @@ static inline void ClearCmdData(ECM_SFUNC_DATA *ctx)
     memset(ctx->cmdBuf, 0, sizeof(ctx->cmdBuf));
 }
 
-// ----------------------------------------------------------------------------
-//  WaitForResponse
-//  Polls ECMUSBRead up to `maxRetries` times and verifies that
-//  rspBuf[slaveIdx].column == expect.
-//
-//  column:  0 = CMD  (16-bit; full value for last slot, masked for others)
-//           1 = Parm (8-bit for slot 0, full 16-bit otherwise)
-//           2 = Data1
-//           3 = Data2
-//
-//  Returns true as soon as the expected value is matched.
-//  Sends an empty keep-alive frame between each retry so the device
-//  has something to respond to (same behaviour as checkResponse in the
-//  vendor sample application).
-// ----------------------------------------------------------------------------
 static bool WaitForResponse(ECM_SFUNC_DATA *ctx,
                              int slaveIdx, int column,
-                             uint32_T expect, unsigned maxRetries)
+                             uint32_T expect, unsigned maxRetries,
+                             uint32_T *lastSeen = nullptr)
 {
+    uint32_T realValue = 0;
+
     for (unsigned retried = 0; retried <= maxRetries; retried++)
     {
         memset(ctx->rspBuf, 0, sizeof(ctx->rspBuf));
-        ECMUSBRead(reinterpret_cast<unsigned char*>(ctx->rspBuf),
-                   sizeof(ctx->rspBuf));
+        
+        // Log the USB read call
+        bool readOk = ECMUSBRead(reinterpret_cast<unsigned char*>(ctx->rspBuf),
+                                 sizeof(ctx->rspBuf));
+        
+        if (!readOk && retried == 0)
+        {
+            // Only log the first read failure to avoid spam
+            mexPrintf("[ECM WaitForResponse] FIRST READ FAILED at retry 0\n"
+                      "[ECM WaitForResponse]   ECMUSBRead returned FALSE\n"
+                      "[ECM WaitForResponse]   Check NEXTWUSBLib.cpp ECM_Log output\n");
+        }
 
-        uint32_T realValue = 0;
         switch (column)
         {
         case 0:
@@ -189,18 +186,38 @@ static bool WaitForResponse(ECM_SFUNC_DATA *ctx,
             break;
         }
 
+        if (retried < 3 || retried % 50 == 0)  // log first 3 retries, then every 50th
+        {
+            mexPrintf("[ECM WaitForResponse] retry=%u  slot=%d  got=0x%02X  want=0x%02X  readOk=%s\n",
+                      retried, slaveIdx, (unsigned)realValue, (unsigned)expect,
+                      readOk ? "YES" : "NO");
+        }
+
         if (realValue == expect)
-            return true;    // success — matched
+        {
+            mexPrintf("[ECM WaitForResponse] SUCCESS at retry=%u  state=0x%02X\n",
+                      retried, (unsigned)realValue);
+            if (lastSeen) *lastSeen = realValue;
+            return true;
+        }
 
         if (retried < maxRetries)
         {
-            // Send an empty frame so the device has something to respond to
             transData clearData[DEF_MA_MAX];
             memset(clearData, 0, sizeof(clearData));
-            ECMUSBWrite(reinterpret_cast<unsigned char*>(clearData),
-                        sizeof(clearData));
+            bool writeOk = ECMUSBWrite(reinterpret_cast<unsigned char*>(clearData),
+                                       sizeof(clearData));
+            
+            if (retried == 0 && !writeOk)
+            {
+                mexPrintf("[ECM WaitForResponse] FIRST WRITE FAILED at retry 0\n");
+            }
+
+            Sleep(10);
         }
     }
+
+    if (lastSeen) *lastSeen = realValue;
     return false;
 }
 
@@ -326,6 +343,74 @@ static void mdlInitializeSampleTimes(SimStruct *S)
     ssSetModelReferenceSampleTimeDefaultInheritance(S);
 }
 
+
+// ============================================================================
+// Diagnostic wrapper for ECMUSBWrite — logs details on failure
+// ============================================================================
+static bool DiagnosticECMUSBWrite(SimStruct *S, unsigned char *data, 
+                                   unsigned long dwLength)
+{
+    mexPrintf("[ECM DiagnosticECMUSBWrite] Attempting write of %lu bytes...\n", dwLength);
+    
+    // Log the expected vs actual size
+    mexPrintf("[ECM DiagnosticECMUSBWrite] Expected frame size: %lu bytes "
+              "(sizeof(transData)*DEF_MA_MAX = %zu*%d)\n",
+              (unsigned long)(sizeof(transData) * DEF_MA_MAX),
+              sizeof(transData), DEF_MA_MAX);
+    
+    // Log the first 32 bytes of what we're sending (for debugging)
+    mexPrintf("[ECM DiagnosticECMUSBWrite] First 32 bytes of buffer: ");
+    for (int i = 0; i < 32 && i < (int)dwLength; i++) {
+        mexPrintf("%02X ", data[i]);
+    }
+    mexPrintf("\n");
+
+    bool result = ECMUSBWrite(data, dwLength);
+    
+    if (!result) {
+        mexPrintf("[ECM DiagnosticECMUSBWrite] FAILED!\n");
+        mexPrintf("[ECM DiagnosticECMUSBWrite] Check NEXTWUSBLib.cpp logs for details\n");
+        mexPrintf("[ECM DiagnosticECMUSBWrite] Possible causes:\n");
+        mexPrintf("[ECM DiagnosticECMUSBWrite]   1. Device disconnected after OpenECMUSB()\n");
+        mexPrintf("[ECM DiagnosticECMUSBWrite]   2. OVERLAPPED handle is invalid\n");
+        mexPrintf("[ECM DiagnosticECMUSBWrite]   3. DLL size mismatch (recompile both?)\n");
+        mexPrintf("[ECM DiagnosticECMUSBWrite]   4. Buffer passed is not 504 bytes exactly\n");
+    } else {
+        mexPrintf("[ECM DiagnosticECMUSBWrite] Success\n");
+    }
+    
+    return result;
+}
+
+// ============================================================================
+// Query function - try a simple GET_STATUS read to test the device
+// ============================================================================
+static bool DiagnosticTestRead(SimStruct *S)
+{
+    mexPrintf("[ECM DiagnosticTestRead] Attempting a test READ to verify device...\n");
+    
+    transData testBuf[DEF_MA_MAX];
+    memset(testBuf, 0, sizeof(testBuf));
+    
+    bool readOk = ECMUSBRead(reinterpret_cast<unsigned char*>(testBuf), sizeof(testBuf));
+    
+    mexPrintf("[ECM DiagnosticTestRead] ECMUSBRead returned: %s\n", 
+              readOk ? "TRUE" : "FALSE");
+    
+    if (readOk) {
+        mexPrintf("[ECM DiagnosticTestRead] Read succeeded! Device is responding.\n");
+        mexPrintf("[ECM DiagnosticTestRead] rspBuf[0].Parm (state) = 0x%02X\n",
+                  testBuf[0].Parm & 0xFF);
+        mexPrintf("[ECM DiagnosticTestRead] rspBuf[0].Data2 (FIFO) = 0x%04X\n",
+                  testBuf[0].Data2 & 0xFFFF);
+    } else {
+        mexPrintf("[ECM DiagnosticTestRead] Read FAILED!\n");
+        mexPrintf("[ECM DiagnosticTestRead] This suggests a fundamental USB/HID issue\n");
+    }
+    
+    return readOk;
+}
+
 // ============================================================================
 //  mdlStart  — hardware initialisation sequence
 //
@@ -374,28 +459,85 @@ static void mdlStart(SimStruct *S)
     for (int i = 0; i < stLen && i < DEF_MA_MAX; i++)
         ctx->slaveType[i] = static_cast<BYTE>(stData[i]);
 
+    mexPrintf("[ECM] DEF_MA_MAX = %d, sizeof(transData) = %zu, "
+              "ECM_FRAME_BYTES should be %zu\n",
+              DEF_MA_MAX, sizeof(transData),
+              (size_t)(sizeof(transData) * DEF_MA_MAX));
+
     // =========================================================================
     // STEP 2 — Open the USB port
     // =========================================================================
+    mexPrintf("[ECM mdlStart] === STEP 2: Opening USB ===\n");
     if (!OpenECMUSB()) {
+        mexPrintf("[ECM mdlStart] CRITICAL: OpenECMUSB() returned FALSE\n");
         ssSetErrorStatus(S, "EC01M: OpenECMUSB failed — check USB connection.");
         free(ctx);
         ssGetPWork(S)[PWORK_CTX_IDX] = nullptr;
         return;
     }
-    Sleep(100);
+    mexPrintf("[ECM mdlStart] OpenECMUSB() succeeded\n");
+    
+    Sleep(1000);
+    mexPrintf("[ECM mdlStart] Post-open delay complete\n");
+
+    // =========================================================================
+    // DIAGNOSTIC: Try a READ first to test the device link
+    // =========================================================================
+    mexPrintf("[ECM mdlStart] === DIAGNOSTIC: Testing device link with READ ===\n");
+    bool testReadOk = DiagnosticTestRead(S);
+    
+    if (!testReadOk) {
+        mexPrintf("[ECM mdlStart] DIAGNOSTIC: Device READ failed!\n");
+        mexPrintf("[ECM mdlStart] This is a fundamental USB/HID communication issue\n");
+        mexPrintf("[ECM mdlStart] The device may be:\n");
+        mexPrintf("[ECM mdlStart]   1. Not actually connected (check Device Manager NOW)\n");
+        mexPrintf("[ECM mdlStart]   2. In a bad state (try power-cycling)\n");
+        mexPrintf("[ECM mdlStart]   3. Using wrong HID driver\n");
+        mexPrintf("[ECM mdlStart]   4. SLDRT kernel mode incompatible with HID API\n");
+        ssSetErrorStatus(S, "EC01M: Diagnostic READ failed. See MATLAB console for details.");
+        CloseECMUSB();
+        return;
+    }
+    
+    mexPrintf("[ECM mdlStart] DIAGNOSTIC: Device READ OK - proceeding to WRITE\n");
 
     // =========================================================================
     // STEP 3 — Transition EtherCAT state machine to PRE-OP
     // =========================================================================
+    mexPrintf("[ECM mdlStart] === STEP 3: Sending SET_STATE -> PRE-OP ===\n");
+    
     ClearCmdData(ctx);
     ctx->cmdBuf[0].CMD   = SET_STATE;
     ctx->cmdBuf[0].Data1 = STATE_PRE_OP;
-    ECMUSBWrite(reinterpret_cast<unsigned char*>(ctx->cmdBuf), sizeof(ctx->cmdBuf));
+    
+    mexPrintf("[ECM mdlStart] cmdBuf buffer info:\n");
+    mexPrintf("[ECM mdlStart]   addr = %p\n", (void*)ctx->cmdBuf);
+    mexPrintf("[ECM mdlStart]   size = %zu bytes\n", sizeof(ctx->cmdBuf));
+    
+    bool writeOk = DiagnosticECMUSBWrite(S, 
+                                         reinterpret_cast<unsigned char*>(ctx->cmdBuf), 
+                                         sizeof(ctx->cmdBuf));
+    
+    if (!writeOk) {
+        mexPrintf("[ECM mdlStart] CRITICAL: ECMUSBWrite failed!\n");
+        mexPrintf("[ECM mdlStart] READ worked but WRITE failed — asymmetric error\n");
+        mexPrintf("[ECM mdlStart] This suggests:\n");
+        mexPrintf("[ECM mdlStart]   1. OVERLAPPED write event is invalid\n");
+        mexPrintf("[ECM mdlStart]   2. Kernel mode incompatibility with WriteFile\n");
+        mexPrintf("[ECM mdlStart]   3. USB write endpoint is stalled\n");
+        ssSetErrorStatus(S, "EC01M: ECMUSBWrite failed. Device read works but write doesn't.");
+        CloseECMUSB();
+        return;
+    }
+    
+    mexPrintf("[ECM mdlStart] SET_STATE write succeeded\n");
+    
     if (!WaitForResponse(ctx, 0, 1, STATE_PRE_OP, 200)) {
         ssSetErrorStatus(S, "EC01M: Timeout waiting for PRE-OP.");
-        CloseECMUSB(); return;
+        CloseECMUSB(); 
+        return;
     }
+    mexPrintf("[ECM mdlStart] PRE-OP confirmed\n");
 
     // =========================================================================
     // STEP 4 — SET_AXIS: define slave topology

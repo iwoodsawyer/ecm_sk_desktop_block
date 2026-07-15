@@ -1,16 +1,16 @@
 // ============================================================================
 // NEXTWUSBLib.h
 // Public header for the NEXTWUSBLib DLL
-// USB EtherCAT EC-01M Master Module Driver — Windows HID API Implementation
+// USB EtherCAT EC-01M Master Module Driver — Windows API Implementation
 //
-// The ECM-SK device enumerates as a USB HID class device (VID 16C0 / PID 05DF)
-// under the standard Windows HidUsb.sys driver. No custom driver or Zadig
-// installation is required.
+// The ECM-SK device enumerates as a USB HID class device (VID 16C0 / PID 05DF),
+// but uses the standard Windows WinUSB.sys driver interface. 
 //
 // Supports both 12-byte (DEF_MA_MAX=42) and 16-byte (DEF_MA_MAX=32)
 // transData packet variants. Define USE_16B before including to select 16B.
 //
-// Platform: Windows (HID API / SetupAPI)
+// Author : Generated for NEXTW EC-01M
+// Platform: Windows (WinUSB / SetupAPI)
 // ============================================================================
 #pragma once
 
@@ -32,7 +32,7 @@ extern "C" {
 // --------------------------------------------------------------------------
 NEXTWUSB_API bool  __stdcall OpenECMUSB   (void);
 NEXTWUSB_API void  __stdcall CloseECMUSB  (void);
-NEXTWUSB_API bool  __stdcall ECMUSBWrite  (const unsigned char *data, unsigned long dwLength);
+NEXTWUSB_API bool  __stdcall ECMUSBWrite  (unsigned char *data, unsigned long dwLength);
 NEXTWUSB_API bool  __stdcall ECMUSBRead   (unsigned char *data, unsigned long dwLength);
 NEXTWUSB_API void  __stdcall ECMUSBRecover(void); // Closes and reopens the HID device handle to clear any stalled state.
 
@@ -101,6 +101,7 @@ NEXTWUSB_API void  __stdcall ECMUSBRecover(void); // Closes and reopens the HID 
 #define IO      SLAVE_IO
 #define HSP     SLAVE_HSP
 #define STEP    SLAVE_STEP
+// NOTE: "None" macro omitted here to avoid conflicts; use SLAVE_NONE instead.
 
 // --------------------------------------------------------------------------
 // Array dimensions
