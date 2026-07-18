@@ -131,6 +131,10 @@ typedef struct _ECM_DEVICE_CTX {
                                         // for the lifetime of the device.
                                         // Used for all bulk transfer and
                                         // policy operations.
+										
+	WINUSB_INTERFACE_HANDLE hWinUsbIf1; // WinUSB Interface 1 handle 
+	                                    // (Scenario A only) obtained by:
+                                        //  WinUsb_GetAssociatedInterface.
     
     UCHAR                   pipeOut;    // Bulk-OUT pipe address (0x01..0x0F).
                                         // Discovered at open time via
@@ -148,7 +152,14 @@ typedef struct _ECM_DEVICE_CTX {
                                         // hFile and hWinUsb are valid.
                                         // Serves as the primary state flag
                                         // for device availability.
-    
+
+    BOOL                    foundViaHID;// Set TRUE by ECM_FindDevicePath()
+                                        // when the device was discovered via 
+                                        // the HID class GUID (SEARCH 2) AND 
+                                        // ECM_FindHIDDeviceGetCompositePath()
+										// successfully re-derived a WinUSB 
+										// composite path for the same device.
+
     WCHAR                   devicePath[MAX_PATH];
                                         // Exact device path used when the
                                         // device was opened. Cached at open
