@@ -604,91 +604,226 @@ void __stdcall ECMUSBRecover(void)
 // ============================================================================
 
 // ============================================================================
-// ECM_FindDevicePathByVidPid_InClass
+// ECM_FindDevicePathByVidPid_WinUSB
 // ============================================================================
 // PURPOSE:
-//   Helper function that searches for a USB device in a specific device class
-//   (HID or USB) by matching Vendor ID and Product ID.
+//   Searches for a WinUSB device matching the target VID/PID by enumerating
+//   all device interfaces registered under GUID_DEVINTERFACE_USB_DEVICE
+//   (the standard interface GUID assigned to devices using the WinUSB driver).
+//
+//   Unlike HID enumeration (which uses a separate class GUID), WinUSB devices
+//   are registered under GUID_DEVINTERFACE_USB_DEVICE when the INF installs
+//   WinUSB.sys as the function driver, making this the correct GUID to query
+//   for WinUSB-bound devices.
 //
 // PARAMETERS:
-//   [in]  HDEVINFO hDevInfo        - Device info set from SetupDiGetClassDevsW
-//   [in]  const WCHAR *vidPidStr   - VID/PID search string (e.g., "VID_16C0&PID_05DF")
-//   [out] WCHAR *pathBuf           - Buffer to store device path if found
-//   [in]  DWORD pathBufLen         - Size of pathBuf in characters (must be MAX_PATH)
-//   [in]  const WCHAR *className   - Device class name for logging ("HID" or "USB")
+//   [in]  const WCHAR *vidPidStr   - VID/PID search string, e.g. "VID_16C0&PID_05DF"
+//   [out] WCHAR *pathBuf           - Buffer to receive device path if found
+//   [in]  DWORD pathBufLen         - Size of pathBuf in characters (MAX_PATH minimum)
 //
 // RETURN VALUE:
-//   TRUE  - Device found and path copied to pathBuf
-//   FALSE - Device not found in this class, or error occurred
+//   TRUE  - Device found as WinUSB; path written to pathBuf
+//   FALSE - Not found, or enumeration error
 //
-// BEHAVIOR:
-//   1. Enumerates all devices in the specified class (HID or USB)
-//   2. For each device, retrieves the hardware ID from registry
-//   3. Compares hardware ID against the search string (case-insensitive)
-//   4. When a match is found:
-//      - Attempts to get device interface using primary GUID
-//      - Falls back to alternate GUID if primary fails
-//      - Retrieves the device path (e.g., \\?\hid#vid_16c0&pid_05df#...)
-//      - Copies path to output buffer if it fits
-//   5. Provides detailed logging for debugging
+// DEVICE PATH FORMAT:
+//   \\?\usb#vid_16c0&pid_05df#0x0001#{dee824ef-729b-4a0e-9c14-b7117d33a817}
 //
 // CRITICAL NOTES:
-//   - For HID devices: Uses GUID_DEVINTERFACE_HID as primary GUID
-//   - For USB devices: Uses GUID_DEVINTERFACE_USB_DEVICE as primary GUID
-//   - Caller MUST provide sufficient buffer (MAX_PATH minimum)
-//   - Device info set (hDevInfo) is cleaned up by this function
-//   - Function logs every step for troubleshooting device enumeration
-//   - Hardware ID matching is case-insensitive using _wcsupr_s
-//
-// EXAMPLE HARDWARE IDs (from Windows registry):
-//   HID device:   USB\VID_16C0&PID_05DF&REV_0100&MI_00
-//   USB device:   USB\VID_16C0&PID_05DF\0x0001
-//
-// LOG OUTPUT EXAMPLES:
-//   [ECM]   Searching in HID class...
-//   [ECM]     Device[0]: USB\VID_16C0&PID_05DF&...
-//   [ECM]           -> ✓ MATCH! Getting device path...
-//   [ECM]           Found path: \\?\hid#vid_16c0&pid_05df#...
-//   [ECM]           ✓✓✓ SUCCESS - Device path copied
-//   [ECM]   HID class: 1 devices, result: ✓ FOUND
-static BOOL ECM_FindDevicePathByVidPid_InClass(
-    HDEVINFO hDevInfo, 
-    const WCHAR *vidPidStr, 
-    WCHAR *pathBuf, 
-    DWORD pathBufLen,
-    const WCHAR *className)
+//   - Uses DIGCF_PRESENT | DIGCF_DEVICEINTERFACE (correct for interface GUIDs)
+//   - Hardware ID is matched before attempting to retrieve the device path
+//   - The device info set is always destroyed before returning
+// ============================================================================
+static BOOL ECM_FindDevicePathByVidPid_WinUSB(
+    const WCHAR *vidPidStr,
+    WCHAR       *pathBuf,
+    DWORD        pathBufLen)
 {
-    ECM_Log("[ECM]   Searching in %ls class...\n", className);
-    
-    SP_DEVINFO_DATA devData = { 0 };
-    devData.cbSize = sizeof(SP_DEVINFO_DATA);
+    ECM_Log("[ECM]   Searching WinUSB devices (GUID_DEVINTERFACE_USB_DEVICE)...\n");
+
+    // Enumerate all present devices that expose a USB device interface.
+    // DIGCF_DEVICEINTERFACE is mandatory for interface-GUID queries;
+    // DIGCF_PRESENT skips disconnected devices.
+    HDEVINFO hDevInfo = SetupDiGetClassDevsW(
+        &GUID_DEVINTERFACE_USB_DEVICE,
+        NULL, NULL,
+        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+
+    if (hDevInfo == INVALID_HANDLE_VALUE)
+    {
+        ECM_Log("[ECM]   WinUSB enumeration failed: 0x%08X\n", GetLastError());
+        return FALSE;
+    }
+
+    // Prepare case-insensitive search string once, outside the loop
+    WCHAR searchUpper[64];
+    wcsncpy_s(searchUpper, 64, vidPidStr, _TRUNCATE);
+    _wcsupr_s(searchUpper, 64);
 
     BOOL found = FALSE;
-    int deviceIndex = 0;
-    
-    for (DWORD idx = 0; SetupDiEnumDeviceInfo(hDevInfo, idx, &devData); idx++)
+    SP_DEVICE_INTERFACE_DATA ifData = { 0 };
+    ifData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+
+    // Walk every interface registered under GUID_DEVINTERFACE_USB_DEVICE
+    for (DWORD idx = 0;
+         SetupDiEnumDeviceInterfaces(hDevInfo, NULL,
+                                     &GUID_DEVINTERFACE_USB_DEVICE,
+                                     idx, &ifData);
+         idx++)
     {
-        WCHAR hwId[512] = { 0 };
-        DWORD requiredSize = 0;
-        
-        if (!SetupDiGetDeviceRegistryPropertyW(
-                hDevInfo, &devData, SPDRP_HARDWAREID,
-                NULL, (PBYTE)hwId, sizeof(hwId), &requiredSize))
+        // ---- Step 1: get the SP_DEVINFO_DATA so we can read the hardware ID ----
+        // We need the size first, then call again with an allocated buffer.
+        DWORD requiredDetailSize = 0;
+        SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
+                                         NULL, 0,
+                                         &requiredDetailSize, NULL);
+        if (requiredDetailSize == 0)
+            continue;
+
+        PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
+            (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)HeapAlloc(
+                GetProcessHeap(), HEAP_ZERO_MEMORY, requiredDetailSize);
+        if (!pDetail)
         {
+            ECM_Log("[ECM]   WinUSB: memory allocation failed\n");
+            break;
+        }
+        pDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+        SP_DEVINFO_DATA devData = { 0 };
+        devData.cbSize = sizeof(SP_DEVINFO_DATA);
+
+        BOOL detailOk = SetupDiGetDeviceInterfaceDetailW(
+            hDevInfo, &ifData,
+            pDetail, requiredDetailSize,
+            NULL, &devData);   // <-- devData is populated here for hardware ID lookup
+
+        if (!detailOk)
+        {
+            ECM_Log("[ECM]   WinUSB[%lu]: GetDeviceInterfaceDetailW failed: 0x%08X\n",
+                    idx, GetLastError());
+            HeapFree(GetProcessHeap(), 0, pDetail);
             continue;
         }
 
-        ECM_Log("[ECM]     Device[%d]: %ls\n", idx, hwId);
-        deviceIndex++;
+        // ---- Step 2: read the hardware ID from the registry and match VID/PID ----
+        WCHAR hwId[512] = { 0 };
+        if (!SetupDiGetDeviceRegistryPropertyW(
+                hDevInfo, &devData, SPDRP_HARDWAREID,
+                NULL, (PBYTE)hwId, sizeof(hwId), NULL))
+        {
+            ECM_Log("[ECM]   WinUSB[%lu]: no hardware ID, skipping\n", idx);
+            HeapFree(GetProcessHeap(), 0, pDetail);
+            continue;
+        }
 
-        // Check for VID/PID match (case-insensitive)
+        ECM_Log("[ECM]   WinUSB[%lu]: %ls\n", idx, hwId);
+
         WCHAR hwIdUpper[512];
         wcsncpy_s(hwIdUpper, 512, hwId, _TRUNCATE);
         _wcsupr_s(hwIdUpper, 512);
 
-        WCHAR searchUpper[64];
-        wcsncpy_s(searchUpper, 64, vidPidStr, _TRUNCATE);
-        _wcsupr_s(searchUpper, 64);
+        if (wcsstr(hwIdUpper, searchUpper) == NULL)
+        {
+            ECM_Log("[ECM]           -> No match\n");
+            HeapFree(GetProcessHeap(), 0, pDetail);
+            continue;
+        }
+
+        // ---- Step 3: VID/PID matched — copy the device path ----
+        ECM_Log("[ECM]           -> ✓ MATCH! Path: %ls\n", pDetail->DevicePath);
+
+        size_t pathLen = wcslen(pDetail->DevicePath) + 1;
+        if (pathLen <= (size_t)pathBufLen)
+        {
+            wcsncpy_s(pathBuf, pathBufLen, pDetail->DevicePath, _TRUNCATE);
+            found = TRUE;
+            ECM_Log("[ECM]           ✓✓✓ SUCCESS - WinUSB device path copied\n");
+        }
+        else
+        {
+            ECM_Log("[ECM]           ERROR: path too long (%zu chars)\n", pathLen);
+        }
+
+        HeapFree(GetProcessHeap(), 0, pDetail);
+
+        if (found)
+            break;
+    }
+
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    ECM_Log("[ECM]   WinUSB search result: %s\n", found ? "✓ FOUND" : "✗ NOT FOUND");
+    return found;
+}
+
+// ============================================================================
+// ECM_FindDevicePathByVidPid_InClass
+// ============================================================================
+// PURPOSE:
+//   Searches for a USB device in a specific device class (HID only in the
+//   current call graph) by matching Vendor ID and Product ID in the hardware
+//   ID registry property.
+//
+// PARAMETERS:
+//   [in]  HDEVINFO hDevInfo        - Device info set (ownership transferred;
+//                                    this function always calls
+//                                    SetupDiDestroyDeviceInfoList on it)
+//   [in]  const WCHAR *vidPidStr   - VID/PID search string, e.g. "VID_16C0&PID_05DF"
+//   [out] WCHAR *pathBuf           - Buffer to receive the device path
+//   [in]  DWORD pathBufLen         - Size of pathBuf in characters (MAX_PATH minimum)
+//   [in]  const WCHAR *className   - Label used in log output (e.g. "HID")
+//
+// RETURN VALUE:
+//   TRUE  - Device found; path written to pathBuf
+//   FALSE - Not found in this class, or error occurred
+//
+// BEHAVIOR:
+//   1. Iterates all SP_DEVINFO_DATA entries in the set
+//   2. Reads SPDRP_HARDWAREID from the registry for each entry
+//   3. Case-insensitive substring match against vidPidStr
+//   4. On match: calls SetupDiEnumDeviceInterfaces with the class-appropriate
+//      GUID (GUID_DEVINTERFACE_HID for HID, GUID_DEVINTERFACE_USB_DEVICE as
+//      fallback) to obtain an interface path
+//   5. Allocates a detail buffer, retrieves DevicePath, copies to pathBuf
+//
+// CRITICAL NOTES:
+//   - hDevInfo is always destroyed before this function returns
+//   - Caller must supply a DIGCF_DEVICEINTERFACE-capable info set
+// ============================================================================
+static BOOL ECM_FindDevicePathByVidPid_InClass(
+    HDEVINFO    hDevInfo,
+    const WCHAR *vidPidStr,
+    WCHAR       *pathBuf,
+    DWORD        pathBufLen,
+    const WCHAR *className)
+{
+    ECM_Log("[ECM]   Searching in %ls class...\n", className);
+
+    SP_DEVINFO_DATA devData = { 0 };
+    devData.cbSize = sizeof(SP_DEVINFO_DATA);
+
+    // Build the uppercase search token once, outside the enumeration loop
+    WCHAR searchUpper[64];
+    wcsncpy_s(searchUpper, 64, vidPidStr, _TRUNCATE);
+    _wcsupr_s(searchUpper, 64);
+
+    BOOL found      = FALSE;
+    int  deviceIndex = 0;
+
+    for (DWORD idx = 0; SetupDiEnumDeviceInfo(hDevInfo, idx, &devData); idx++)
+    {
+        WCHAR hwId[512] = { 0 };
+        if (!SetupDiGetDeviceRegistryPropertyW(
+                hDevInfo, &devData, SPDRP_HARDWAREID,
+                NULL, (PBYTE)hwId, sizeof(hwId), NULL))
+            continue;
+
+        ECM_Log("[ECM]     Device[%lu]: %ls\n", idx, hwId);
+        deviceIndex++;
+
+        // Case-insensitive VID/PID match
+        WCHAR hwIdUpper[512];
+        wcsncpy_s(hwIdUpper, 512, hwId, _TRUNCATE);
+        _wcsupr_s(hwIdUpper, 512);
 
         if (wcsstr(hwIdUpper, searchUpper) == NULL)
         {
@@ -698,64 +833,55 @@ static BOOL ECM_FindDevicePathByVidPid_InClass(
 
         ECM_Log("[ECM]           -> ✓ MATCH! Getting device path...\n");
 
-        // Found the matching device; now get its interface path
+        // Determine the primary interface GUID for this class
+        GUID *primaryGuid = (className[0] == L'H')
+            ? (GUID *)&GUID_DEVINTERFACE_HID
+            : (GUID *)&GUID_DEVINTERFACE_USB_DEVICE;
+        GUID *fallbackGuid = (className[0] == L'H')
+            ? (GUID *)&GUID_DEVINTERFACE_USB_DEVICE
+            : (GUID *)&GUID_DEVINTERFACE_HID;
+
         SP_DEVICE_INTERFACE_DATA ifData = { 0 };
         ifData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
 
-        // For HID devices, use HID GUID; for USB, use USB DEVICE GUID
-        GUID *searchGuid = (className[0] == L'H') ? 
-            (GUID*)&GUID_DEVINTERFACE_HID : 
-            (GUID*)&GUID_DEVINTERFACE_USB_DEVICE;
-
-        if (!SetupDiEnumDeviceInterfaces(hDevInfo, &devData, searchGuid, 0, &ifData))
+        if (!SetupDiEnumDeviceInterfaces(hDevInfo, &devData, primaryGuid, 0, &ifData))
         {
-            DWORD err = GetLastError();
-            ECM_Log("[ECM]           SetupDiEnumDeviceInterfaces failed: 0x%08X\n", err);
-            
-            // Try alternate GUID
-            GUID *altGuid = (className[0] == L'H') ? 
-                (GUID*)&GUID_DEVINTERFACE_USB_DEVICE : 
-                (GUID*)&GUID_DEVINTERFACE_HID;
-                
-            if (!SetupDiEnumDeviceInterfaces(hDevInfo, &devData, altGuid, 0, &ifData))
+            ECM_Log("[ECM]           SetupDiEnumDeviceInterfaces (primary) failed: 0x%08X; "
+                    "trying fallback GUID\n", GetLastError());
+            if (!SetupDiEnumDeviceInterfaces(hDevInfo, &devData, fallbackGuid, 0, &ifData))
             {
-                ECM_Log("[ECM]           Alternate GUID also failed\n");
+                ECM_Log("[ECM]           Fallback GUID also failed: 0x%08X\n",
+                        GetLastError());
                 continue;
             }
         }
 
-        // Get interface detail size
+        // Determine buffer size required for interface detail
         DWORD requiredDetailSize = 0;
         SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
                                          NULL, 0, &requiredDetailSize, NULL);
-
         if (requiredDetailSize == 0)
         {
             ECM_Log("[ECM]           Failed to get interface detail size\n");
             continue;
         }
 
-        // Allocate space for interface detail
         PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
             (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)HeapAlloc(
                 GetProcessHeap(), HEAP_ZERO_MEMORY, requiredDetailSize);
-        
         if (!pDetail)
         {
             ECM_Log("[ECM]           Memory allocation failed\n");
             break;
         }
-
         pDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-        
-        // Get the actual interface detail (device path)
+
         if (SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
                                              pDetail, requiredDetailSize,
                                              NULL, NULL))
         {
             ECM_Log("[ECM]           Found path: %ls\n", pDetail->DevicePath);
-            
-            // Verify path length
+
             size_t pathLen = wcslen(pDetail->DevicePath) + 1;
             if (pathLen <= (size_t)pathBufLen)
             {
@@ -765,15 +891,15 @@ static BOOL ECM_FindDevicePathByVidPid_InClass(
             }
             else
             {
-                ECM_Log("[ECM]           ERROR: Path too long\n");
+                ECM_Log("[ECM]           ERROR: path too long (%zu chars)\n", pathLen);
             }
         }
         else
         {
-            DWORD err = GetLastError();
-            ECM_Log("[ECM]           GetDeviceInterfaceDetailW failed: 0x%08X\n", err);
+            ECM_Log("[ECM]           GetDeviceInterfaceDetailW failed: 0x%08X\n",
+                    GetLastError());
         }
-        
+
         HeapFree(GetProcessHeap(), 0, pDetail);
 
         if (found)
@@ -781,10 +907,158 @@ static BOOL ECM_FindDevicePathByVidPid_InClass(
     }
 
     SetupDiDestroyDeviceInfoList(hDevInfo);
-    
-    ECM_Log("[ECM]   %ls class: %d devices, result: %s\n", 
+    ECM_Log("[ECM]   %ls class: %d devices examined, result: %s\n",
             className, deviceIndex, found ? "✓ FOUND" : "✗ NOT FOUND");
-    
+    return found;
+}
+
+// ============================================================================
+// ECM_FindDevicePathByVidPid_AllUSB
+// ============================================================================
+// PURPOSE:
+//   Last-resort search across ALL present USB devices regardless of class or
+//   driver. Enumerates with DIGCF_PRESENT (no DIGCF_DEVICEINTERFACE) to reach
+//   devices that are not registered with any particular interface GUID, then
+//   attempts to obtain a usable device path via GUID_DEVINTERFACE_USB_DEVICE.
+//
+//   This search covers devices that have no class driver, are listed as
+//   "Unknown Device", or whose INF did not register a device interface.
+//
+// PARAMETERS:
+//   [in]  const WCHAR *vidPidStr   - VID/PID search string, e.g. "VID_16C0&PID_05DF"
+//   [out] WCHAR *pathBuf           - Buffer to receive the device path
+//   [in]  DWORD pathBufLen         - Size of pathBuf in characters (MAX_PATH minimum)
+//
+// RETURN VALUE:
+//   TRUE  - Device found and a usable path was obtained
+//   FALSE - Device not found, or found but no interface path available
+//
+// NOTES:
+//   Because many devices visible via DIGCF_PRESENT do not register a device
+//   interface, this search may locate the hardware ID but still fail to obtain
+//   a CreateFile-able path. In that case the function logs a diagnostic message
+//   and returns FALSE rather than returning a path that cannot be opened.
+// ============================================================================
+static BOOL ECM_FindDevicePathByVidPid_AllUSB(
+    const WCHAR *vidPidStr,
+    WCHAR       *pathBuf,
+    DWORD        pathBufLen)
+{
+    ECM_Log("[ECM]   Searching all USB devices (DIGCF_PRESENT, enumerator=USB)...\n");
+
+    // DIGCF_PRESENT only — no DIGCF_DEVICEINTERFACE.
+    // This reaches devices with no registered interface GUID.
+    HDEVINFO hDevInfo = SetupDiGetClassDevsW(
+        NULL, L"USB", NULL,
+        DIGCF_PRESENT);
+
+    if (hDevInfo == INVALID_HANDLE_VALUE)
+    {
+        ECM_Log("[ECM]   All-USB enumeration failed: 0x%08X\n", GetLastError());
+        return FALSE;
+    }
+
+    WCHAR searchUpper[64];
+    wcsncpy_s(searchUpper, 64, vidPidStr, _TRUNCATE);
+    _wcsupr_s(searchUpper, 64);
+
+    BOOL found      = FALSE;
+    int  totalSeen  = 0;
+
+    SP_DEVINFO_DATA devData = { 0 };
+    devData.cbSize = sizeof(SP_DEVINFO_DATA);
+
+    for (DWORD idx = 0; SetupDiEnumDeviceInfo(hDevInfo, idx, &devData); idx++)
+    {
+        WCHAR hwId[512] = { 0 };
+        if (!SetupDiGetDeviceRegistryPropertyW(
+                hDevInfo, &devData, SPDRP_HARDWAREID,
+                NULL, (PBYTE)hwId, sizeof(hwId), NULL))
+            continue;
+
+        ECM_Log("[ECM]   AllUSB[%lu]: %ls\n", idx, hwId);
+        totalSeen++;
+
+        WCHAR hwIdUpper[512];
+        wcsncpy_s(hwIdUpper, 512, hwId, _TRUNCATE);
+        _wcsupr_s(hwIdUpper, 512);
+
+        if (wcsstr(hwIdUpper, searchUpper) == NULL)
+            continue;
+
+        ECM_Log("[ECM]           -> ✓ MATCH! Attempting to retrieve interface path...\n");
+
+        // Attempt to get a device interface path via GUID_DEVINTERFACE_USB_DEVICE.
+        // This may fail if the device has no registered interface (e.g., no INF),
+        // in which case we report what we found but cannot return a path.
+        SP_DEVICE_INTERFACE_DATA ifData = { 0 };
+        ifData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+
+        if (!SetupDiEnumDeviceInterfaces(hDevInfo, &devData,
+                                         &GUID_DEVINTERFACE_USB_DEVICE, 0, &ifData))
+        {
+            ECM_Log("[ECM]           SetupDiEnumDeviceInterfaces failed: 0x%08X\n"
+                    "[ECM]           Device present but has no registered USB interface path.\n"
+                    "[ECM]           Install WinUSB or HID driver (e.g. via Zadig) to proceed.\n",
+                    GetLastError());
+            // Hardware ID matched but no path obtainable — keep searching
+            // in case a second enumeration entry for the same hardware has
+            // a path (composite devices can have multiple entries).
+            continue;
+        }
+
+        DWORD requiredDetailSize = 0;
+        SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
+                                         NULL, 0, &requiredDetailSize, NULL);
+        if (requiredDetailSize == 0)
+        {
+            ECM_Log("[ECM]           Failed to get interface detail size\n");
+            continue;
+        }
+
+        PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
+            (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)HeapAlloc(
+                GetProcessHeap(), HEAP_ZERO_MEMORY, requiredDetailSize);
+        if (!pDetail)
+        {
+            ECM_Log("[ECM]           Memory allocation failed\n");
+            break;
+        }
+        pDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+        if (SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
+                                             pDetail, requiredDetailSize,
+                                             NULL, NULL))
+        {
+            ECM_Log("[ECM]           Found path: %ls\n", pDetail->DevicePath);
+
+            size_t pathLen = wcslen(pDetail->DevicePath) + 1;
+            if (pathLen <= (size_t)pathBufLen)
+            {
+                wcsncpy_s(pathBuf, pathBufLen, pDetail->DevicePath, _TRUNCATE);
+                found = TRUE;
+                ECM_Log("[ECM]           ✓✓✓ SUCCESS - All-USB device path copied\n");
+            }
+            else
+            {
+                ECM_Log("[ECM]           ERROR: path too long (%zu chars)\n", pathLen);
+            }
+        }
+        else
+        {
+            ECM_Log("[ECM]           GetDeviceInterfaceDetailW failed: 0x%08X\n",
+                    GetLastError());
+        }
+
+        HeapFree(GetProcessHeap(), 0, pDetail);
+
+        if (found)
+            break;
+    }
+
+    SetupDiDestroyDeviceInfoList(hDevInfo);
+    ECM_Log("[ECM]   All-USB search: %d devices examined, result: %s\n",
+            totalSeen, found ? "✓ FOUND" : "✗ NOT FOUND");
     return found;
 }
 
@@ -792,114 +1066,75 @@ static BOOL ECM_FindDevicePathByVidPid_InClass(
 // ECM_FindDevicePathByVidPid
 // ============================================================================
 // PURPOSE:
-//   Main device discovery function. Searches for an EC-01M USB device by
-//   Vendor ID and Product ID across all device classes (HID, USB, and generic).
-//   
-//   The device may be enumerated as either HID or USB depending on driver
-//   installation, so this function tries multiple search strategies.
+//   Main device discovery function. Locates the EC-01M USB device by Vendor ID
+//   and Product ID using three searches in priority order:
+//
+//   SEARCH 1 — WinUSB devices  (primary target)
+//   ─────────────────────────────────────────────
+//   Enumerates all interfaces registered under GUID_DEVINTERFACE_USB_DEVICE
+//   using DIGCF_PRESENT | DIGCF_DEVICEINTERFACE. This is the correct approach
+//   for devices bound to WinUSB.sys because WinUSB registers each device
+//   instance under this interface GUID when the INF installs it.
+//   Device paths start with \\?\usb#vid_...
+//
+//   SEARCH 2 — HID class devices  (legacy / dual-enumeration)
+//   ──────────────────────────────────────────────────────────
+//   Enumerates all HID class interfaces using the GUID returned by
+//   HidD_GetHidGuid(). Covers devices that enumerate as standard HID (VID 16C0
+//   / PID 05DF is a V-USB generic HID VID/PID). This search works correctly in
+//   the existing implementation and is kept as the second stage.
+//   Device paths start with \\?\hid#vid_...
+//
+//   SEARCH 3 — All USB devices  (catch-all fallback)
+//   ──────────────────────────────────────────────────
+//   Enumerates every present USB device (DIGCF_PRESENT, enumerator "USB")
+//   regardless of class or interface GUID. Reaches devices with no class
+//   driver or no registered device interface. If the hardware ID matches it
+//   attempts to obtain a GUID_DEVINTERFACE_USB_DEVICE interface path; if no
+//   path is obtainable it logs a diagnostic and returns FALSE.
+//   Device paths start with \\?\usb#...
 //
 // PARAMETERS:
-//   [out] WCHAR *pathBuf   - Buffer to store device path if found
-//   [in]  DWORD pathBufLen - Size of pathBuf in characters (must be MAX_PATH)
+//   [out] WCHAR *pathBuf   - Buffer to receive the device path (MAX_PATH minimum)
+//   [in]  DWORD pathBufLen - Size of pathBuf in characters
 //
 // RETURN VALUE:
-//   TRUE  - Device found; path is in pathBuf
-//   FALSE - Device not found; try troubleshooting steps
+//   TRUE  - Device found; pathBuf is populated and ready for CreateFileW
+//   FALSE - Device not found via any strategy; check log output for diagnostics
 //
-// SEARCH STRATEGY (in order):
-//   
-//   SEARCH 1: HID CLASS DEVICES (most likely)
-//   ─────────────────────────────────────────
-//   - Searches for device in HID (Human Interface Device) class
-//   - Uses HID class GUID obtained from HidD_GetHidGuid()
-//   - Your EC-01M device is typically enumerated here
-//   - Success means device path starts with \\?\hid#...
-//
-//   SEARCH 2: USB DEVICE CLASS (WinUSB scenario)
-//   ──────────────────────────────────────────────
-//   - Searches for device in USB Device class
-//   - Uses GUID_DEVCLASS_USB_DEVICE
-//   - Only if WinUSB driver is pre-installed and device re-enumerated
-//   - Success means device path starts with \\?\usb#...
-//
-//   SEARCH 3: ALL USB DEVICES (fallback)
-//   ────────────────────────────────────
-//   - Generic enumeration of all USB devices
-//   - Uses minimal SetupAPI flags (DIGCF_PRESENT only)
-//   - Last resort; provides diagnostic output but no device path
-//
-// CRITICAL PARAMETERS (in NEXTWUSBLib_internal.h):
-//   ECM_USB_VID = 0x16C0   (Vendor ID)
-//   ECM_USB_PID = 0x05DF   (Product ID)
-//   Search string: "VID_16C0&PID_05DF" (case-insensitive)
-//
-// DEVICE PATH FORMAT:
-//   HID path:     \\?\hid#vid_16c0&pid_05df#0x0001#{GUID}
-//   USB path:     \\?\usb#vid_16c0&pid_05df#0x0001
-//
-// RETURN VALUE INTERPRETATION:
-//   TRUE with pathBuf filled
-//     → Device found! Ready to call CreateFileW(pathBuf, ...)
-//   
-//   FALSE with detailed log output
-//     → Device not found; check log output for:
-//        * Which search succeeded (tells you device class)
-//        * What devices were found (tells you VID/PID mismatch)
-//        * Which SetupAPI calls failed and why (error codes)
-//
-// LOG OUTPUT STRUCTURE:
-//   [ECM] ECM_FindDevicePathByVidPid: Searching for VID_16C0&PID_05DF
-//   [ECM] SEARCH 1: HID Class Devices
-//   [ECM]   Searching in HID class...
-//   [ECM]     Device[0]: USB\VID_16C0&PID_05DF&REV_0100&MI_00
-//   [ECM]           -> ✓ MATCH! Getting device path...
-//   [ECM]           Found path: \\?\hid#vid_16c0&pid_05df#0x0001#...
-//   [ECM]           ✓✓✓ SUCCESS - Device path copied
-//   [ECM]   HID class: 1 devices, result: ✓ FOUND
-//
-// TROUBLESHOOTING:
-//   
-//   ✗ All searches return "NOT FOUND"
-//   → Device is not connected, or VID/PID is different
-//   → Check Device Manager: what devices are visible?
-//   → Share the "Device[X]" VID/PID from SEARCH 3 fallback output
-//
-//   ✗ SetupDiGetClassDevsW fails: 0x0000000D (ERROR_INVALID_DATA)
-//   → GUID enumeration issue; try fallback search
-//   → This function retries with different GUIDs automatically
-//
-//   ✗ HidD_GetHidGuid fails or returns wrong GUID
-//   → HID driver not installed; WinUSB driver may be in use instead
-//   → Check SEARCH 2 output
-//
-//   ✗ Device found in SEARCH 3 but not in SEARCH 1 or 2
-//   → Device enumerated as generic USB; no proper driver class
-//   → May need to install HID or WinUSB driver
-//   → Use Zadig tool to select correct driver
+// TROUBLESHOOTING (check log output):
+//   All three searches return NOT FOUND
+//     → Device not connected, or actual VID/PID differs from ECM_USB_VID/PID
+//     → Check Device Manager and compare "AllUSB[n]" log lines
+//   Match found in SEARCH 3 but no interface path
+//     → Device has no driver; use Zadig to install WinUSB or HID driver
+//   SEARCH 1 succeeds but CreateFile later fails with ACCESS_DENIED
+//     → Another process owns the WinUSB handle; verify no other instances running
 //
 // REAL-TIME SAFETY:
-//   This function uses SetupAPI which is NOT real-time safe.
-//   Call this ONLY during initialization, NOT in the real-time control loop.
-//   Device path discovery should happen once in mdlStart, then cached.
-//
-// INTEGRATION:
-//   Called from OpenECMUSB() in mdlStart phase
-//   Device path is cached in g_Dev.devicePath
-//   Subsequent calls use CreateFileW(g_Dev.devicePath, ...) without re-search
+//   Uses SetupAPI — NOT real-time safe. Call ONLY during initialisation
+//   (mdlStart), never from the real-time control loop (mdlOutputs).
+// ============================================================================
 static BOOL ECM_FindDevicePathByVidPid(WCHAR *pathBuf, DWORD pathBufLen)
 {
-    ECM_Log("[ECM] ECM_FindDevicePathByVidPid: Searching for VID_%04X&PID_%04X\n", 
+    ECM_Log("[ECM] ECM_FindDevicePathByVidPid: Searching for VID_%04X&PID_%04X\n",
             ECM_USB_VID, ECM_USB_PID);
-    
+
     WCHAR vidPidStr[64];
     swprintf_s(vidPidStr, 64, L"VID_%04X&PID_%04X", ECM_USB_VID, ECM_USB_PID);
 
-    // ===== SEARCH 1: HID CLASS (most likely - your device is here!) =====
-    ECM_Log("[ECM] SEARCH 1: HID Class Devices\n");
-    
+    // ===== SEARCH 1: WinUSB devices (primary — device may be WinUSB-bound) =====
+    ECM_Log("[ECM] SEARCH 1: WinUSB Devices (GUID_DEVINTERFACE_USB_DEVICE)\n");
+    if (ECM_FindDevicePathByVidPid_WinUSB(vidPidStr, pathBuf, pathBufLen))
+    {
+        ECM_Log("[ECM] ✓ Found via SEARCH 1 (WinUSB)\n");
+        return TRUE;
+    }
+
+    // ===== SEARCH 2: HID class devices (legacy / V-USB generic HID) =====
+    ECM_Log("[ECM] SEARCH 2: HID Class Devices\n");
     GUID hidGuid;
     HidD_GetHidGuid(&hidGuid);
-    
     HDEVINFO hHidInfo = SetupDiGetClassDevsW(
         &hidGuid, NULL, NULL,
         DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
@@ -907,9 +1142,10 @@ static BOOL ECM_FindDevicePathByVidPid(WCHAR *pathBuf, DWORD pathBufLen)
     if (hHidInfo != INVALID_HANDLE_VALUE)
     {
         if (ECM_FindDevicePathByVidPid_InClass(
-            hHidInfo, vidPidStr, pathBuf, pathBufLen, L"HID"))
+                hHidInfo, vidPidStr, pathBuf, pathBufLen, L"HID"))
         {
-            return TRUE;  // Found in HID class!
+            ECM_Log("[ECM] ✓ Found via SEARCH 2 (HID)\n");
+            return TRUE;
         }
     }
     else
@@ -917,68 +1153,15 @@ static BOOL ECM_FindDevicePathByVidPid(WCHAR *pathBuf, DWORD pathBufLen)
         ECM_Log("[ECM]   HID enumeration failed: 0x%08X\n", GetLastError());
     }
 
-    // ===== SEARCH 2: USB CLASS =====
-    ECM_Log("[ECM] SEARCH 2: USB Device Class\n");
-    
-    HDEVINFO hUsbInfo = SetupDiGetClassDevsW(
-        &GUID_DEVCLASS_USB_DEVICE, NULL, NULL,
-        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
-
-    if (hUsbInfo != INVALID_HANDLE_VALUE)
+    // ===== SEARCH 3: All USB devices — catch-all fallback =====
+    ECM_Log("[ECM] SEARCH 3: All USB Devices (catch-all fallback)\n");
+    if (ECM_FindDevicePathByVidPid_AllUSB(vidPidStr, pathBuf, pathBufLen))
     {
-        if (ECM_FindDevicePathByVidPid_InClass(
-            hUsbInfo, vidPidStr, pathBuf, pathBufLen, L"USB"))
-        {
-            return TRUE;  // Found in USB class
-        }
-    }
-    else
-    {
-        ECM_Log("[ECM]   USB enumeration failed: 0x%08X\n", GetLastError());
+        ECM_Log("[ECM] ✓ Found via SEARCH 3 (All USB fallback)\n");
+        return TRUE;
     }
 
-    // ===== SEARCH 3: ALL USB DEVICES (fallback) =====
-    ECM_Log("[ECM] SEARCH 3: All USB Devices (by name)\n");
-    
-    HDEVINFO hAllUsb = SetupDiGetClassDevsW(
-        NULL, L"USB", NULL,
-        DIGCF_PRESENT);
-
-    if (hAllUsb != INVALID_HANDLE_VALUE)
-    {
-        SP_DEVINFO_DATA devData = { 0 };
-        devData.cbSize = sizeof(SP_DEVINFO_DATA);
-        
-        int deviceIndex = 0;
-        for (DWORD idx = 0; SetupDiEnumDeviceInfo(hAllUsb, idx, &devData); idx++)
-        {
-            WCHAR hwId[512] = { 0 };
-            if (!SetupDiGetDeviceRegistryPropertyW(
-                    hAllUsb, &devData, SPDRP_HARDWAREID,
-                    NULL, (PBYTE)hwId, sizeof(hwId), NULL))
-                continue;
-
-            ECM_Log("[ECM]   Device[%d]: %ls\n", idx, hwId);
-            deviceIndex++;
-
-            WCHAR hwIdUpper[512];
-            wcsncpy_s(hwIdUpper, 512, hwId, _TRUNCATE);
-            _wcsupr_s(hwIdUpper, 512);
-
-            WCHAR searchUpper[64];
-            wcsncpy_s(searchUpper, 64, vidPidStr, _TRUNCATE);
-            _wcsupr_s(searchUpper, 64);
-
-            if (wcsstr(hwIdUpper, searchUpper) != NULL)
-            {
-                ECM_Log("[ECM]     ✓ MATCH FOUND\n");
-            }
-        }
-        SetupDiDestroyDeviceInfoList(hAllUsb);
-        ECM_Log("[ECM]   Total devices found: %d\n", deviceIndex);
-    }
-
-    ECM_Log("[ECM] ✗✗✗ DEVICE NOT FOUND in any search\n");
+    ECM_Log("[ECM] ✗✗✗ DEVICE NOT FOUND via any search strategy\n");
     return FALSE;
 }
 
