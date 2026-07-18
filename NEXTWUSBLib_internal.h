@@ -6,6 +6,7 @@
 #pragma once
 
 #define WIN32_LEAN_AND_MEAN
+#include <initguid.h>
 #include <Windows.h>
 #include <SetupAPI.h>
 #include <winusb.h>
@@ -18,7 +19,12 @@
 #include <cstdio>
 #include <cstring>
 #include <cassert>
-#include "mex.h"
+#ifdef MATLAB_MEX_FILE
+  #include "mex.h"
+  #define ECM_LOG_EXTRA(s) mexPrintf("%s", s)
+#else
+  #define ECM_LOG_EXTRA(s)
+#endif
 
 // --------------------------------------------------------------------------
 // EC-01M USB Device Identity
@@ -33,31 +39,6 @@
 // --------------------------------------------------------------------------
 #define ECM_USB_VID              0x16C0
 #define ECM_USB_PID              0x05DF
-
-// --------------------------------------------------------------------------
-// WinUSB Device Interface GUID
-// Must match the INF / OS descriptor GUID. The generic WinUSB GUID below
-// {A5DCBF10-6530-11D2-901F-00C04FB951ED} works for many devices;
-// replace with the device-specific GUID from your INF if available.
-// --------------------------------------------------------------------------
-
-// HID Interface GUID
-//static const GUID GUID_DEVINTERFACE_HID = {
-//    0x4d1e55b2, 0xf16f, 0x11cf,
-//    { 0x88, 0xcb, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30 }
-//};
-
-// USB Device Interface GUID
-static const GUID GUID_DEVINTERFACE_USB_DEVICE = {
-    0xa5dcbf10, 0x6530, 0x11d2,
-    { 0x90, 0x1f, 0x00, 0xc0, 0x4f, 0xb9, 0x51, 0xed }
-};
-
-// USB Device Class GUID
-static const GUID GUID_DEVCLASS_USB_DEVICE = {
-    0x88bae032, 0x5a81, 0x49f0,
-    { 0xbc, 0x3d, 0xa4, 0xff, 0x13, 0x82, 0x16, 0xd6 }
-};
 
 // --------------------------------------------------------------------------
 // USB pipe endpoint addresses for bulk transfers
@@ -182,12 +163,12 @@ typedef struct _ECM_DEVICE_CTX {
 // --------------------------------------------------------------------------
 static inline void ECM_Log(const char *fmt, ...)
 {
-    char buf[512];
+    char buf[1024];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
     OutputDebugStringA(buf);
     // Optionally also print to console:
-    mexPrintf("%s", buf);
+    ECM_LOG_EXTRA(buf);
 }

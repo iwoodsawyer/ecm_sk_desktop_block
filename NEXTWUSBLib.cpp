@@ -499,7 +499,7 @@ void __stdcall CloseECMUSB(void)
 //  only. Transient failures are handled by the caller in mdlOutputs by
 //  repeating the last valid command on the next cycle.
 // ============================================================================
-bool __stdcall ECMUSBWrite(unsigned char *data, unsigned long dwLength)
+bool __stdcall ECMUSBWrite(const unsigned char *data, unsigned long dwLength)
 {
     if (!g_Dev.isOpen || data == NULL || dwLength == 0)
     {
@@ -644,8 +644,8 @@ bool __stdcall ECMUSBRead(unsigned char *data, unsigned long dwLength)
 // ============================================================================
 void __stdcall ECMUSBRecover(void)
 {
-    if (!g_Dev.isOpen)
-        return;
+    if (!g_Dev.isOpen && g_Dev.devicePath[0] == L'\0')
+        return; // No path to recover with
 
     // *** Mark closed IMMEDIATELY — before any handle operations ***
     // If any step below fails and we return early, ECMUSBWrite/Read will
@@ -846,7 +846,7 @@ static BOOL ECM_MatchHardwareId(
     // the list ends with an empty string (double null terminator).
     // We upper-case and substring-search each entry independently.
     const WCHAR* end = (const WCHAR*)((PBYTE)hwIdBuf + requiredSize);
-    for (const WCHAR *p = hwIdBuf; p < end && *p != L'\0'; p += wcslen(p) + 1))
+    for (const WCHAR *p = hwIdBuf; p < end && *p != L'\0'; p += wcslen(p) + 1)
     {
         ECM_Log("[ECM]     HW-ID: %ls\n", p);
 
@@ -1002,11 +1002,18 @@ static BOOL ECM_FindDevicePathByVidPid_WinUSB(
         // Two-call pattern: first call returns required buffer size,
         // second call fills the detail struct including DevicePath and
         // populates devData for the hardware ID query.
-        DWORD reqSize = 0;
-        SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
-                                         NULL, 0, &reqSize, NULL);
-        if (reqSize == 0)
-            continue;
+		DWORD reqSize = 0;
+		if (!SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
+											   NULL, 0, &reqSize, NULL))
+		{
+			DWORD err = GetLastError();
+			if (err != ERROR_INSUFFICIENT_BUFFER)
+			{
+				ECM_Log("[ECM]   WinUSB[%lu]: GetDeviceInterfaceDetailW size-query "
+						"failed: 0x%08X (unexpected)\n", idx, err);
+				continue;
+			}
+		}
 
         PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
             (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)HeapAlloc(
@@ -1156,14 +1163,18 @@ static BOOL ECM_FindDevicePathByVidPid_AllUSB(
         }
 
         // Two-call pattern for interface detail
-        DWORD reqSize = 0;
-        SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
-                                         NULL, 0, &reqSize, NULL);
-        if (reqSize == 0)
-        {
-            ECM_Log("[ECM]   AllUSB[%lu]: failed to get detail size\n", idx);
-            continue;
-        }
+		DWORD reqSize = 0;
+		if (!SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
+											   NULL, 0, &reqSize, NULL))
+		{
+			DWORD err = GetLastError();
+			if (err != ERROR_INSUFFICIENT_BUFFER)
+			{
+				ECM_Log("[ECM]   AllUSB[%lu]: GetDeviceInterfaceDetailW size-query "
+						"failed: 0x%08X (unexpected)\n", idx, err);
+				continue;
+			}
+		}
 
         PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
             (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)HeapAlloc(
