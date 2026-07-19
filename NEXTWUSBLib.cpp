@@ -267,6 +267,7 @@ static ECM_DEVICE_CTX g_Dev = {
     0,                      // pipeIn
     UsbdPipeTypeControl,    // pipeOutType  (0 = control, safe "not yet discovered" sentinel)
     UsbdPipeTypeControl,    // pipeInType   (0 = control, safe "not yet discovered" sentinel)
+    0,                      // outMaxPacketSize
     FALSE,                  // isOpen
     { 0 }                   // devicePath
 };
@@ -509,6 +510,60 @@ bool __stdcall ECMUSBWrite(const unsigned char *data, unsigned long dwLength)
         return false;
     }
 
+    // Pad payload to the next multiple of the OUT pipe's MaxPacketSize.
+    // Interrupt OUT endpoints expect transfers aligned to MaxPacketSize;
+    // sending a short packet causes the device firmware to hang waiting
+    // for the remaining bytes, locking the endpoint and NAKing all
+    // subsequent transfers until the device is power-cycled.
+    //
+    // Example: 504-byte frame, MaxPacketSize=512 → pad to 512 bytes.
+    // Example: 512-byte frame, MaxPacketSize=512 → no padding needed.
+    // Example: 504-byte frame, MaxPacketSize=64  → pad to 512 bytes (8 packets).
+    ULONG  maxPkt    = g_Dev.outMaxPacketSize;   // cached from WinUsb_QueryPipe
+    ULONG  writeLen  = (maxPkt > 0 && (dwLength % maxPkt) != 0)
+                       ? dwLength + (maxPkt - (dwLength % maxPkt))
+                       : (ULONG)dwLength;
+
+    // One-time log: report padding behaviour on the first call only.
+    static bool s_paddingLogged = false;
+    if (!s_paddingLogged)
+    {
+        s_paddingLogged = true;
+        ULONG frameBytes   = (ULONG)(sizeof(transData) * DEF_MA_MAX);
+        ULONG remainder    = frameBytes % (ULONG)g_Dev.outMaxPacketSize;
+        ULONG paddedBytes  = (remainder != 0)
+            ? frameBytes + ((ULONG)g_Dev.outMaxPacketSize - remainder)
+            : frameBytes;
+
+        if (remainder != 0)
+            ECM_Log("[ECM] NOTE: Frame size %lu is not a multiple of OUT maxPkt=%u — "
+                    "writes will be padded to %lu bytes.\n",
+                    frameBytes,
+                    (unsigned)g_Dev.outMaxPacketSize,
+                    paddedBytes);
+        else
+            ECM_Log("[ECM] NOTE: Frame size %lu is an exact multiple of OUT maxPkt=%u — "
+                    "no padding needed.\n",
+                    frameBytes,
+                    (unsigned)g_Dev.outMaxPacketSize);
+    }
+
+    // Stack buffer is fine — max frame size is 512 bytes.
+    // If writeLen could exceed 512, use a heap allocation instead.
+    unsigned char writeBuf[512] = { 0 };
+    PUCHAR pWriteData = const_cast<PUCHAR>(data);
+
+    if (writeLen != (ULONG)dwLength)
+    {
+        if (writeLen > sizeof(writeBuf))
+        {
+            ECM_Log("[ECM] ECMUSBWrite: padded size %lu exceeds buffer — aborting.\n", writeLen);
+            return false;
+        }
+        memcpy(writeBuf, data, dwLength);
+        pWriteData = writeBuf;
+    }
+
     // Perform the bulk write. WinUsb_WritePipe internally uses overlapped I/O
     // with the timeout configured in OpenECMUSB, so this call will not block
     // indefinitely if the device is stalled or disconnected.
@@ -516,8 +571,8 @@ bool __stdcall ECMUSBWrite(const unsigned char *data, unsigned long dwLength)
     BOOL ok = WinUsb_WritePipe(
         g_Dev.hWinUsb,
         g_Dev.pipeOut,
-        const_cast<PUCHAR>(data),
-        (ULONG)dwLength,
+        pWriteData,
+        writeLen,
         &bytesWritten,
         NULL);  // NULL = use internal overlapped I/O (timeout-bounded)
 
@@ -525,7 +580,7 @@ bool __stdcall ECMUSBWrite(const unsigned char *data, unsigned long dwLength)
     // protocol layer. The hold-last strategy ensures the last valid command
     // is repeated by the caller, preventing loss of synchronization.
     // Do NOT reset pipes here — that's left for ECMUSBRecover() at shutdown.
-    if (!ok || bytesWritten != (ULONG)dwLength)
+    if (!ok || bytesWritten != writeLen)
     {
         DWORD err = GetLastError();
         if (err == ERROR_SEM_TIMEOUT)
@@ -535,7 +590,7 @@ bool __stdcall ECMUSBWrite(const unsigned char *data, unsigned long dwLength)
         else
             ECM_Log("[ECM] ECMUSBWrite failed: Err=0x%08X "
                     "(wrote %lu / %lu bytes, hold last).\n",
-                    err, bytesWritten, dwLength);
+                    err, bytesWritten, writeLen);
         return false;
     }
 
@@ -831,16 +886,16 @@ static void ECM_ApplyPipePolicies(void)
         else
             ECM_Log("[ECM] SetPipePolicy(OUT, AUTO_FLUSH) enabled.\n");
     }
-    else if (g_Dev.pipeOutType == UsbdPipeTypeInterrupt)
-    {
-        UCHAR rawIo = TRUE;
-        if (!WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeOut,
-                                  RAW_IO, sizeof(UCHAR), &rawIo))
-            ECM_Log("[ECM] SetPipePolicy(OUT, RAW_IO) failed: 0x%08X (non-fatal).\n",
-                    GetLastError());
-        else
-            ECM_Log("[ECM] SetPipePolicy(OUT, RAW_IO) enabled.\n");
-    }
+    // else if (g_Dev.pipeOutType == UsbdPipeTypeInterrupt)
+    // {
+    //     UCHAR rawIo = TRUE;
+    //     if (!WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeOut,
+    //                               RAW_IO, sizeof(UCHAR), &rawIo))
+    //         ECM_Log("[ECM] SetPipePolicy(OUT, RAW_IO) failed: 0x%08X (non-fatal).\n",
+    //                 GetLastError());
+    //     else
+    //         ECM_Log("[ECM] SetPipePolicy(OUT, RAW_IO) enabled.\n");
+    // }
 
     // Allow partial reads on IN: short transfers complete immediately.
     // Without this, short reads wait for a full buffer and then time out.
@@ -1318,6 +1373,7 @@ static BOOL ECM_QueryPipes(void)
             {
                 g_Dev.pipeOut = pipeInfo.PipeId;
                 g_Dev.pipeOutType = pipeInfo.PipeType;
+                g_Dev.outMaxPacketSize = pipeInfo.MaximumPacketSize;
                 foundOut = TRUE;
                 ECM_Log("[ECM]   -> Assigned Bulk-OUT (host→device).\n");
             }
@@ -1338,6 +1394,17 @@ static BOOL ECM_QueryPipes(void)
                 foundOut, foundIn);
         return FALSE;
     }
+
+    // Log and catch any future size mismatch
+    ULONG maxTransferSize = 0;
+    ULONG sizeLen = sizeof(ULONG);
+    if (WinUsb_GetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeOut,
+                             MAXIMUM_TRANSFER_SIZE, &sizeLen, &maxTransferSize))
+        ECM_Log("[ECM]   OUT pipe MAXIMUM_TRANSFER_SIZE = %lu bytes.\n", maxTransferSize);
+
+    if (WinUsb_GetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeIn,
+                             MAXIMUM_TRANSFER_SIZE, &sizeLen, &maxTransferSize))
+        ECM_Log("[ECM]   IN  pipe MAXIMUM_TRANSFER_SIZE = %lu bytes.\n", maxTransferSize);
 
     return TRUE;
 }

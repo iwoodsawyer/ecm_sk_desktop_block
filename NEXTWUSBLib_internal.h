@@ -137,6 +137,13 @@ typedef struct _ECM_DEVICE_CTX {
                                         // WinUsb_QueryPipe and cached
                                         // alongside pipeIn.
 
+    USHORT                  outMaxPacketSize;           
+                                        // MaximumPacketSize of OUT pipe, from WinUsb_QueryPipe.
+                                        // Used by ECMUSBWrite to pad short frames to a full
+                                        // packet boundary. Prevents firmware deadlock caused
+                                        // by short-packet reception on fixed-size endpoints.
+                                        // Populated by ECM_QueryPipes. Default 0 = no padding.
+
     BOOL                    isOpen;     // TRUE while device is open and both
                                         // hFile and hWinUsb are valid.
                                         // Serves as the primary state flag
