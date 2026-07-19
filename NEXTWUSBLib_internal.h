@@ -6,8 +6,9 @@
 #pragma once
 
 #define WIN32_LEAN_AND_MEAN
-#include <initguid.h>
 #include <Windows.h>
+#include <initguid.h>
+#include <usbiodef.h>
 #include <SetupAPI.h>
 #include <winusb.h>
 #include <cfgmgr32.h>
@@ -46,7 +47,7 @@
 // (discoverable via WinUsb_QueryPipe at runtime — see OpenECMUSB impl.)
 // These are compile-time defaults used if pipe discovery fails.
 // --------------------------------------------------------------------------
-#define ECM_PIPE_OUT_DEFAULT     0x01   // Bulk OUT  EP1
+#define ECM_PIPE_OUT_DEFAULT     0x02   // Bulk OUT  EP1
 #define ECM_PIPE_IN_DEFAULT      0x81   // Bulk IN   EP1
 
 // --------------------------------------------------------------------------
@@ -57,7 +58,8 @@
 // the caller indefinitely. This is critical for real-time systems where
 // timing predictability is required.
 // --------------------------------------------------------------------------
-#define ECM_USB_TIMEOUT_MS       3000
+#define ECM_USB_TIMEOUT_MS        3000
+#define ECM_USB_WRITE_TIMEOUT_MS   200 
 
 // --------------------------------------------------------------------------
 // Internal device state (one global instance)
@@ -125,6 +127,16 @@ typedef struct _ECM_DEVICE_CTX {
                                         // across all ECMUSBRead calls.
                                         // Used in ECMUSBRead operations.
     
+    USBD_PIPE_TYPE          pipeOutType;// Endpoint type of the OUT pipe,
+                                        // discovered at open time via
+                                        // WinUsb_QueryPipe and cached
+                                        // alongside pipeOut.
+
+    USBD_PIPE_TYPE          pipeInType; // Endpoint type of the IN pipe,
+                                        // discovered at open time via
+                                        // WinUsb_QueryPipe and cached
+                                        // alongside pipeIn.
+
     BOOL                    isOpen;     // TRUE while device is open and both
                                         // hFile and hWinUsb are valid.
                                         // Serves as the primary state flag

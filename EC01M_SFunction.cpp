@@ -203,6 +203,9 @@ static bool WaitForResponse(ECM_SFUNC_DATA *ctx,
 
         if (retried < maxRetries)
         {
+            if (retried > 0)
+                ECMUSBAbortOut();
+
             transData clearData[DEF_MA_MAX];
             memset(clearData, 0, sizeof(clearData));
             bool writeOk = ECMUSBWrite(reinterpret_cast<unsigned char*>(clearData),

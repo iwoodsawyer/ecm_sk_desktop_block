@@ -265,6 +265,8 @@ static ECM_DEVICE_CTX g_Dev = {
     NULL,                   // hWinUsb
     0,                      // pipeOut
     0,                      // pipeIn
+    UsbdPipeTypeControl,    // pipeOutType  (0 = control, safe "not yet discovered" sentinel)
+    UsbdPipeTypeControl,    // pipeInType   (0 = control, safe "not yet discovered" sentinel)
     FALSE,                  // isOpen
     { 0 }                   // devicePath
 };
@@ -514,7 +516,7 @@ bool __stdcall ECMUSBWrite(const unsigned char *data, unsigned long dwLength)
     BOOL ok = WinUsb_WritePipe(
         g_Dev.hWinUsb,
         g_Dev.pipeOut,
-        data,
+        const_cast<PUCHAR>(data),
         (ULONG)dwLength,
         &bytesWritten,
         NULL);  // NULL = use internal overlapped I/O (timeout-bounded)
@@ -723,6 +725,47 @@ void __stdcall ECMUSBRecover(void)
 }
 
 // ============================================================================
+//  ECMUSBAbortOut
+//  Aborts any pending transfer on the bulk/interrupt OUT pipe and resets it
+//  to a clean state. Called automatically by ECMUSBWrite on timeout, and
+//  available to the caller for explicit pipe recovery.
+//
+//  When WinUsb_WritePipe times out or fails, the OUT pipe is left in a
+//  halted state — subsequent write attempts hit the same stalled pipe and
+//  fail immediately regardless of timeout value. AbortPipe cancels any
+//  pending I/O queued in the WinUSB driver, and ResetPipe clears the halt
+//  condition on both the host controller and the device endpoint, restoring
+//  the pipe's data toggle to DATA0 and allowing the next write to proceed.
+//
+//  Teardown order (MUST follow this sequence):
+//    1. WinUsb_AbortPipe  — cancels all pending I/O on the pipe.
+//       Returns immediately; does not wait for in-flight transfers to drain.
+//    2. WinUsb_ResetPipe  — sends a CLEAR_FEATURE(ENDPOINT_HALT) request to
+//       the device and resets the host-side data toggle. Requires AbortPipe
+//       to have been called first; resetting a pipe with pending I/O yields
+//       undefined behaviour in the driver stack.
+//
+//  *** NOT REAL-TIME SAFE ***
+//  WinUsb_ResetPipe issues a control transfer to the device endpoint
+//  (CLEAR_FEATURE request on EP0) which can take 1-10 ms depending on
+//  device firmware response time. Do NOT call from the real-time control
+//  loop (mdlOutputs). ECMUSBWrite calls this internally on timeout so the
+//  NEXT call to ECMUSBWrite starts with a clean pipe; the current cycle
+//  simply returns false and the caller applies hold-last.
+//
+//  No-op if the device is not open (isOpen == FALSE). Safe to call from
+//  ECMUSBRecover before reopening — AbortPipe on a closed handle is
+//  harmless because isOpen guards the entry point.
+// ============================================================================
+void __stdcall ECMUSBAbortOut(void)
+{
+    if (!g_Dev.isOpen) return;
+    WinUsb_AbortPipe(g_Dev.hWinUsb, g_Dev.pipeOut);
+    WinUsb_ResetPipe(g_Dev.hWinUsb, g_Dev.pipeOut);
+    ECM_Log("[ECM] ECMUSBAbortOut: OUT pipe aborted and reset.\n");
+}
+
+// ============================================================================
 // ============================================================================
 //  INTERNAL HELPERS
 // ============================================================================
@@ -764,40 +807,56 @@ static void ECM_ApplyPipePolicies(void)
 {
     // Timeout on both pipes. Non-fatal if SetPipePolicy fails — WinUSB
     // provides internal timeout mechanisms via driver defaults.
-    ULONG timeout = ECM_USB_TIMEOUT_MS;
+    ULONG writeTimeout = ECM_USB_WRITE_TIMEOUT_MS;
     if (!WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeOut,
-                              PIPE_TRANSFER_TIMEOUT, sizeof(ULONG), &timeout))
-        ECM_Log("[ECM] SetPipePolicy(OUT, TIMEOUT) failed: 0x%08X "
-                "(non-fatal).\n", GetLastError());
+                              PIPE_TRANSFER_TIMEOUT, sizeof(ULONG), &writeTimeout))
+        ECM_Log("[ECM] SetPipePolicy(OUT, TIMEOUT) failed: 0x%08X (non-fatal).\n",
+                GetLastError());
 
+    ULONG readTimeout = ECM_USB_TIMEOUT_MS;
     if (!WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeIn,
-                              PIPE_TRANSFER_TIMEOUT, sizeof(ULONG), &timeout))
-        ECM_Log("[ECM] SetPipePolicy(IN, TIMEOUT) failed: 0x%08X "
-                "(non-fatal).\n", GetLastError());
+                              PIPE_TRANSFER_TIMEOUT, sizeof(ULONG), &readTimeout))
+        ECM_Log("[ECM] SetPipePolicy(IN, TIMEOUT) failed: 0x%08X (non-fatal).\n",
+                GetLastError());
 
-    // Auto-flush on OUT: send ZLP at exact multiples of MaxPacketSize.
-    // Ensures device recognises frame boundaries; prevents stale buffering.
-    UCHAR autoFlush = TRUE;
-    if (!WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeOut,
-                              AUTO_FLUSH, sizeof(UCHAR), &autoFlush))
-        ECM_Log("[ECM] SetPipePolicy(OUT, AUTO_FLUSH) failed: 0x%08X "
-                "(non-fatal).\n", GetLastError());
+    // AUTO_FLUSH applies to Bulk only — sends ZLP at exact MaxPacketSize multiples.
+    // RAW_IO applies to Interrupt only — bypasses WinUSB transfer queue.
+    if (g_Dev.pipeOutType == UsbdPipeTypeBulk)
+    {
+        UCHAR autoFlush = TRUE;
+        if (!WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeOut,
+                                  AUTO_FLUSH, sizeof(UCHAR), &autoFlush))
+            ECM_Log("[ECM] SetPipePolicy(OUT, AUTO_FLUSH) failed: 0x%08X (non-fatal).\n",
+                    GetLastError());
+        else
+            ECM_Log("[ECM] SetPipePolicy(OUT, AUTO_FLUSH) enabled.\n");
+    }
+    else if (g_Dev.pipeOutType == UsbdPipeTypeInterrupt)
+    {
+        UCHAR rawIo = TRUE;
+        if (!WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeOut,
+                                  RAW_IO, sizeof(UCHAR), &rawIo))
+            ECM_Log("[ECM] SetPipePolicy(OUT, RAW_IO) failed: 0x%08X (non-fatal).\n",
+                    GetLastError());
+        else
+            ECM_Log("[ECM] SetPipePolicy(OUT, RAW_IO) enabled.\n");
+    }
 
     // Allow partial reads on IN: short transfers complete immediately.
     // Without this, short reads wait for a full buffer and then time out.
     UCHAR allowPartial = TRUE;
     if (!WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeIn,
                               ALLOW_PARTIAL_READS, sizeof(UCHAR), &allowPartial))
-        ECM_Log("[ECM] SetPipePolicy(IN, ALLOW_PARTIAL_READS) failed: 0x%08X "
-                "(non-fatal).\n", GetLastError());
+        ECM_Log("[ECM] SetPipePolicy(IN, ALLOW_PARTIAL_READS) failed: 0x%08X (non-fatal).\n",
+                GetLastError());
 
     // Disable IGNORE_SHORT_PACKETS: notify app on short frames so protocol
     // frame boundary violations are detected immediately, not silently ignored.
     UCHAR ignoreShort = FALSE;
     if (!WinUsb_SetPipePolicy(g_Dev.hWinUsb, g_Dev.pipeIn,
                               IGNORE_SHORT_PACKETS, sizeof(UCHAR), &ignoreShort))
-        ECM_Log("[ECM] SetPipePolicy(IN, IGNORE_SHORT_PACKETS) failed: 0x%08X "
-                "(non-fatal).\n", GetLastError());
+        ECM_Log("[ECM] SetPipePolicy(IN, IGNORE_SHORT_PACKETS) failed: 0x%08X (non-fatal).\n",
+                GetLastError());
 }
 
 // ============================================================================
@@ -913,7 +972,7 @@ static BOOL ECM_FindDevicePath(WCHAR *pathBuf, DWORD pathBufLen)
             ECM_USB_VID, ECM_USB_PID);
 
     WCHAR vidPidStr[64];
-    swprintf_s(vidPidStr, 64, L"VID_%04X&PID_%04X&MI_01", ECM_USB_VID, ECM_USB_PID); 
+    swprintf_s(vidPidStr, 64, L"VID_%04X&PID_%04X", ECM_USB_VID, ECM_USB_PID); 
 
     // ===== SEARCH 1: GUID_DEVINTERFACE_USB_DEVICE (primary) =================
     ECM_Log("[ECM] SEARCH 1: GUID_DEVINTERFACE_USB_DEVICE\n");
@@ -974,9 +1033,8 @@ static BOOL ECM_FindDevicePathByVidPid_WinUSB(
     // DIGCF_DEVICEINTERFACE is mandatory for interface-GUID queries.
     // DIGCF_PRESENT skips disconnected devices.
     HDEVINFO hDevInfo = SetupDiGetClassDevsW(
-        &GUID_DEVINTERFACE_USB_DEVICE,
-        NULL, NULL,
-        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        NULL, L"USB", NULL,
+        DIGCF_PRESENT | DIGCF_ALLCLASSES);
 
     if (hDevInfo == INVALID_HANDLE_VALUE)
     {
@@ -1105,16 +1163,13 @@ static BOOL ECM_FindDevicePathByVidPid_AllUSB(
     WCHAR       *pathBuf,
     DWORD        pathBufLen)
 {
-    ECM_Log("[ECM]   Searching all USB devices "
-            "(DIGCF_PRESENT | DIGCF_DEVICEINTERFACE, enumerator=USB)...\n");
+    ECM_Log("[ECM]   Searching all USB devices (DIGCF_ALLCLASSES, enumerator=USB)...\n");
 
-    // DIGCF_DEVICEINTERFACE is required so SetupDiEnumDeviceInterfaces can
-    // retrieve interface paths. Without this flag it always fails with
-    // ERROR_NO_MORE_ITEMS, making path retrieval impossible.
-    // DIGCF_PRESENT skips disconnected devices.
+    // DIGCF_ALLCLASSES + enumerator=USB: enumerates all USB device nodes.
+    // DIGCF_DEVICEINTERFACE is NOT used here (requires non-NULL GUID).
     HDEVINFO hDevInfo = SetupDiGetClassDevsW(
         NULL, L"USB", NULL,
-        DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+        DIGCF_PRESENT | DIGCF_ALLCLASSES);   // ← fixed
 
     if (hDevInfo == INVALID_HANDLE_VALUE)
     {
@@ -1128,89 +1183,65 @@ static BOOL ECM_FindDevicePathByVidPid_AllUSB(
 
     BOOL found     = FALSE;
     int  totalSeen = 0;
-
     SP_DEVINFO_DATA devData = { 0 };
     devData.cbSize = sizeof(SP_DEVINFO_DATA);
 
     for (DWORD idx = 0; SetupDiEnumDeviceInfo(hDevInfo, idx, &devData); idx++)
     {
         totalSeen++;
-
-        // Search all strings in the REG_MULTI_SZ hardware ID list.
         if (!ECM_MatchHardwareId(hDevInfo, &devData, searchUpper))
             continue;
 
-        ECM_Log("[ECM]   AllUSB[%lu]: MATCH! Retrieving interface path...\n",
-                idx);
+        ECM_Log("[ECM]   AllUSB[%lu]: MATCH! Retrieving interface path via CM...\n", idx);
 
-        // Retrieve the GUID_DEVINTERFACE_USB_DEVICE interface path for this
-        // node. Because the info set was created with DIGCF_DEVICEINTERFACE,
-        // this call will succeed if the device has a registered interface path.
-        SP_DEVICE_INTERFACE_DATA ifData = { 0 };
-        ifData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
-
-        if (!SetupDiEnumDeviceInterfaces(hDevInfo, &devData,
-                                         &GUID_DEVINTERFACE_USB_DEVICE,
-                                         0, &ifData))
+        // Retrieve the device instance ID (e.g. "USB\VID_16C0&PID_05DF\...")
+        WCHAR instanceId[MAX_PATH] = { 0 };
+        if (!SetupDiGetDeviceInstanceIdW(hDevInfo, &devData,
+                                         instanceId, MAX_PATH, NULL))
         {
-            // Device matched by hardware ID but has no WinUSB interface path.
-            // This means WinUSB.sys is not installed on this interface.
-            ECM_Log("[ECM]   AllUSB[%lu]: no USB device interface path "
-                    "(0x%08X) — WinUSB.sys not installed on this interface.\n"
-                    "[ECM]   Use Zadig to install WinUSB on Interface 1.\n",
+            ECM_Log("[ECM]   AllUSB[%lu]: GetDeviceInstanceId failed: 0x%08X\n",
                     idx, GetLastError());
             continue;
         }
 
-        // Two-call pattern for interface detail
-		DWORD reqSize = 0;
-		if (!SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
-											   NULL, 0, &reqSize, NULL))
-		{
-			DWORD err = GetLastError();
-			if (err != ERROR_INSUFFICIENT_BUFFER)
-			{
-				ECM_Log("[ECM]   AllUSB[%lu]: GetDeviceInterfaceDetailW size-query "
-						"failed: 0x%08X (unexpected)\n", idx, err);
-				continue;
-			}
-		}
+        // Use CM_Get_Device_Interface_List to get the CreateFile-able path.
+        // This works for both WinUSB (GUID_DEVINTERFACE_USB_DEVICE) and
+        // libwdi whole-device installs (GUID_DEVCLASS_USB_DEVICE).
+        ULONG bufLen = 0;
+        CONFIGRET cr = CM_Get_Device_Interface_List_SizeW(
+            &bufLen, const_cast<LPGUID>(&GUID_DEVINTERFACE_USB_DEVICE),
+            instanceId, CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
 
-        PSP_DEVICE_INTERFACE_DETAIL_DATA_W pDetail =
-            (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)HeapAlloc(
-                GetProcessHeap(), HEAP_ZERO_MEMORY, reqSize);
-        if (!pDetail)
+        if (cr != CR_SUCCESS || bufLen <= 1)
         {
-            ECM_Log("[ECM]   Memory allocation failed\n");
-            break;
+            ECM_Log("[ECM]   AllUSB[%lu]: CM_Get_Device_Interface_List_Size: "
+                    "cr=0x%X bufLen=%lu\n", idx, cr, bufLen);
+            continue;
         }
-        pDetail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
 
-        if (SetupDiGetDeviceInterfaceDetailW(hDevInfo, &ifData,
-                                             pDetail, reqSize,
-                                             NULL, NULL))
+        WCHAR *ifList = (WCHAR *)HeapAlloc(GetProcessHeap(),
+                                            HEAP_ZERO_MEMORY,
+                                            bufLen * sizeof(WCHAR));
+        if (!ifList) break;
+
+        cr = CM_Get_Device_Interface_ListW(
+            const_cast<LPGUID>(&GUID_DEVINTERFACE_USB_DEVICE),
+            instanceId, ifList, bufLen,
+            CM_GET_DEVICE_INTERFACE_LIST_PRESENT);
+
+        if (cr == CR_SUCCESS && ifList[0] != L'\0')
         {
-            ECM_Log("[ECM]   AllUSB[%lu]: path: %ls\n",
-                    idx, pDetail->DevicePath);
-
-            size_t pathLen = wcslen(pDetail->DevicePath) + 1;
-            if (pathLen <= (size_t)pathBufLen)
-            {
-                wcsncpy_s(pathBuf, pathBufLen, pDetail->DevicePath, _TRUNCATE);
-                found = TRUE;
-            }
-            else
-            {
-                ECM_Log("[ECM]   ERROR: path too long (%zu chars)\n", pathLen);
-            }
+            ECM_Log("[ECM]   AllUSB[%lu]: path: %ls\n", idx, ifList);
+            wcsncpy_s(pathBuf, pathBufLen, ifList, _TRUNCATE);
+            found = TRUE;
         }
         else
         {
-            ECM_Log("[ECM]   AllUSB[%lu]: GetDeviceInterfaceDetailW failed: "
-                    "0x%08X\n", idx, GetLastError());
+            ECM_Log("[ECM]   AllUSB[%lu]: CM_Get_Device_Interface_List failed: "
+                    "cr=0x%X\n", idx, cr);
         }
 
-        HeapFree(GetProcessHeap(), 0, pDetail);
+        HeapFree(GetProcessHeap(), 0, ifList);
         if (found) break;
     }
 
@@ -1272,24 +1303,28 @@ static BOOL ECM_QueryPipes(void)
         }
 
         ECM_Log("[ECM]   Pipe[%d]: type=%d (0=ctrl,1=iso,2=bulk,3=int) "
-                "addr=0x%02X maxPkt=%u\n",
+                "addr=0x%02X maxPkt=%u %s\n",
                 (int)i, (int)pipeInfo.PipeType,
                 (unsigned)pipeInfo.PipeId,
-                (unsigned)pipeInfo.MaximumPacketSize);
+                (unsigned)pipeInfo.MaximumPacketSize,
+                (pipeInfo.PipeType == UsbdPipeTypeInterrupt) ? "[INTERRUPT]" : "[BULK]");
 
-        // Only process bulk endpoints — ignore control, isochronous, interrupt
-        if (pipeInfo.PipeType == UsbdPipeTypeBulk)
+        // Accept both Bulk and Interrupt — ignore control, isochronous, interrupt
+        if (pipeInfo.PipeType == UsbdPipeTypeBulk ||
+            pipeInfo.PipeType == UsbdPipeTypeInterrupt)
         {
             // Bit 7 of PipeId: 0 = OUT (host→device), 1 = IN (device→host)
             if ((pipeInfo.PipeId & 0x80) == 0 && !foundOut)
             {
                 g_Dev.pipeOut = pipeInfo.PipeId;
+                g_Dev.pipeOutType = pipeInfo.PipeType;
                 foundOut = TRUE;
                 ECM_Log("[ECM]   -> Assigned Bulk-OUT (host→device).\n");
             }
             else if ((pipeInfo.PipeId & 0x80) != 0 && !foundIn)
             {
                 g_Dev.pipeIn = pipeInfo.PipeId;
+                g_Dev.pipeInType  = pipeInfo.PipeType;
                 foundIn = TRUE;
                 ECM_Log("[ECM]   -> Assigned Bulk-IN  (device→host).\n");
             }

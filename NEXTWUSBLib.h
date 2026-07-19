@@ -30,12 +30,13 @@ extern "C" {
 // --------------------------------------------------------------------------
 // Core DLL API
 // --------------------------------------------------------------------------
-NEXTWUSB_API bool  __stdcall OpenECMUSB   (void);
-NEXTWUSB_API void  __stdcall CloseECMUSB  (void);
-NEXTWUSB_API bool  __stdcall ECMUSBWrite  (const unsigned char *data, unsigned long dwLength);
-NEXTWUSB_API bool  __stdcall ECMUSBRead   (unsigned char *data, unsigned long dwLength);
-NEXTWUSB_API void  __stdcall ECMUSBRecover(void); // Closes and reopens the HID device handle to clear any stalled state.
-
+NEXTWUSB_API bool  __stdcall OpenECMUSB    (void);
+NEXTWUSB_API void  __stdcall CloseECMUSB   (void);
+NEXTWUSB_API bool  __stdcall ECMUSBWrite   (const unsigned char *data, unsigned long dwLength);
+NEXTWUSB_API bool  __stdcall ECMUSBRead    (unsigned char *data, unsigned long dwLength);
+NEXTWUSB_API void  __stdcall ECMUSBRecover (void); // Closes and reopens the HID device handle to clear any stalled state.
+NEXTWUSB_API void  __stdcall ECMUSBAbortOut(void);
+    
 #ifdef __cplusplus
 } // extern "C"
 #endif
